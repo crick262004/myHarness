@@ -1,0 +1,25 @@
+[project]
+name = "myharness"
+version = "0.1.0"
+description = "A minimal local AI agent harness: loop, tools, MCP, memory, evals."
+requires-python = ">=3.11"
+dependencies = [
+    "anthropic>=0.116.0",
+    "mcp>=1.0.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["evals/deterministic"]
+markers = [
+    "api: eval hits the real Anthropic API (skipped when ANTHROPIC_API_KEY is unset)",
+]
+
+[tool.uv]
+package = false
