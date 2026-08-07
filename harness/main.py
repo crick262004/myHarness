@@ -1,4 +1,4 @@
-"""Phase 1: the REPL — read your input, run one turn, print the reply.
+"""The REPL — read your input, run one turn, print the reply.
 
 Run with:  uv run python -m harness.main
 """
@@ -14,6 +14,7 @@ import anthropic
 from dotenv import load_dotenv
 
 from .agent import Agent
+from .tools import ToolRegistry, build_builtin_tools
 
 # Application policy lives here, not in the Agent. Values come from the
 # environment (a local .env is loaded below), with sensible defaults.
@@ -25,8 +26,16 @@ def build_system_prompt(workdir: Path) -> str:
     return (
         "You are MyHarness, a minimal personal AI agent running in a local terminal REPL.\n"
         f"Working directory: {workdir}\n"
+        "Use your tools to inspect files before answering questions about them.\n"
         "Be direct and concise."
     )
+
+
+def build_registry(workdir: Path) -> ToolRegistry:
+    registry = ToolRegistry()
+    for tool in build_builtin_tools(workdir):
+        registry.register(tool)
+    return registry
 
 
 async def main() -> None:
@@ -38,10 +47,13 @@ async def main() -> None:
     model = os.environ.get("MYHARNESS_MODEL", DEFAULT_MODEL)
     max_tokens = int(os.environ.get("MYHARNESS_MAX_TOKENS", DEFAULT_MAX_TOKENS))
 
-    async with anthropic.AsyncAnthropic() as client:  # picks up ANTHROPIC_API_KEY itself
-        agent = Agent(client, build_system_prompt(Path.cwd()), model, max_tokens)
+    workdir = Path.cwd()
+    registry = build_registry(workdir)
 
-        print(f"MyHarness · {model} · /clear wipes history · /exit quits")
+    async with anthropic.AsyncAnthropic() as client:  # picks up ANTHROPIC_API_KEY itself
+        agent = Agent(client, registry, build_system_prompt(workdir), model, max_tokens)
+
+        print(f"MyHarness · {model} · /tools lists tools · /clear wipes history · /exit quits")
         while True:
             try:
                 user_input = input("\nyou> ").strip()
@@ -57,9 +69,13 @@ async def main() -> None:
                 agent.clear()
                 print("(history cleared — the model now remembers nothing)")
                 continue
+            if user_input == "/tools":
+                for name in registry.names():
+                    print(f"  {name}")
+                continue
 
             try:
-                reply = await agent.run_turn(user_input)
+                result = await agent.run_turn(user_input)
             except KeyboardInterrupt:  # Ctrl-C while waiting on the model
                 print("\n(interrupted — turn discarded)")
                 continue
@@ -70,7 +86,7 @@ async def main() -> None:
                 print("[network error — check your connection]")
                 continue
 
-            print(f"\nclaude> {reply}")
+            print(f"\nmyHarnessAgent> {result.text}")
 
 
 if __name__ == "__main__":
