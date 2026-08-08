@@ -16,6 +16,7 @@ import anthropic
 from dotenv import load_dotenv
 
 from .agent import Agent
+from .mcp_client import MCPManager
 from .tools import ToolRegistry, build_builtin_tools
 
 # Application policy lives here, not in the Agent. Values come from the
@@ -68,6 +69,13 @@ async def main() -> None:
     workdir = Path.cwd()
     registry = build_registry(workdir)
 
+    # Bridge external MCP servers into the same registry. Best-effort: a
+    # broken server prints a warning; the harness runs regardless.
+    mcp = MCPManager()
+    await mcp.connect_all(workdir / "mcp_config.json", registry)
+    for line in mcp.status_lines():
+        print(line)
+
     async with anthropic.AsyncAnthropic() as client:  # picks up ANTHROPIC_API_KEY itself
         agent = Agent(
             client,
@@ -80,39 +88,42 @@ async def main() -> None:
         )
 
         print(f"MyHarness · {model} · /tools lists tools · /clear wipes history · /exit quits")
-        while True:
-            try:
-                user_input = input("\nyou> ").strip()
-            except (EOFError, KeyboardInterrupt):  # Ctrl-D / Ctrl-C
-                print()
-                break
+        try:
+            while True:
+                try:
+                    user_input = input("\nyou> ").strip()
+                except (EOFError, KeyboardInterrupt):  # Ctrl-D / Ctrl-C
+                    print()
+                    break
 
-            if not user_input:
-                continue
-            if user_input == "/exit":
-                break
-            if user_input == "/clear":
-                agent.clear()
-                print("(history cleared — the model now remembers nothing)")
-                continue
-            if user_input == "/tools":
-                for name in registry.names():
-                    print(f"  {name}")
-                continue
+                if not user_input:
+                    continue
+                if user_input == "/exit":
+                    break
+                if user_input == "/clear":
+                    agent.clear()
+                    print("(history cleared — the model now remembers nothing)")
+                    continue
+                if user_input == "/tools":
+                    for name in registry.names():
+                        print(f"  {name}")
+                    continue
 
-            try:
-                result = await agent.run_turn(user_input)
-            except KeyboardInterrupt:  # Ctrl-C while waiting on the model
-                print("\n(interrupted — turn discarded)")
-                continue
-            except anthropic.APIStatusError as exc:  # the API said no (4xx/5xx)
-                print(f"[api error {exc.status_code}] {exc.message}")
-                continue
-            except anthropic.APIConnectionError:  # never reached the API
-                print("[network error — check your connection]")
-                continue
+                try:
+                    result = await agent.run_turn(user_input)
+                except KeyboardInterrupt:  # Ctrl-C while waiting on the model
+                    print("\n(interrupted — turn discarded)")
+                    continue
+                except anthropic.APIStatusError as exc:  # the API said no (4xx/5xx)
+                    print(f"[api error {exc.status_code}] {exc.message}")
+                    continue
+                except anthropic.APIConnectionError:  # never reached the API
+                    print("[network error — check your connection]")
+                    continue
 
-            print(f"\nmyHarnessAgent> {result.text}")
+                print(f"\nmyHarnessAgent> {result.text}")
+        finally:
+            await mcp.aclose()  # shut down server connections/subprocesses
 
 
 if __name__ == "__main__":
