@@ -16,13 +16,23 @@ That loop is the whole trick behind every agent product.
 
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 from anthropic import AsyncAnthropic
 
 from .tools import ToolRegistry
+
+# Safety valve: total tool executions allowed in ONE user turn, summed across
+# every loop iteration (not per-reply parallelism). A model stuck in a tool
+# loop stops getting tools after this and is forced to answer in text.
+MAX_TOOL_CALLS_PER_TURN = 50
+
+# Frontend hooks. The Agent does no console I/O itself — the REPL passes
+# console implementations; evals pass nothing (approve=None runs gated tools
+# without asking, on_trace=None is silent).
+ApproveFn = Callable[[str, dict[str, Any]], Awaitable[bool]]
+TraceFn = Callable[[str, dict[str, Any]], None]
 
 
 @dataclass
@@ -58,8 +68,8 @@ class Agent:
         model: str,
         max_tokens: int,
         *,
-        auto_approve: bool = False,  # evals set True to skip the y/N prompt
-        quiet: bool = False,         # suppress the ⏺ trace lines
+        approve: ApproveFn | None = None,
+        on_trace: TraceFn | None = None,
     ) -> None:
         self.client = client
         self.registry = registry
@@ -68,8 +78,8 @@ class Agent:
         self.system_prompt = system_prompt
         self.model = model
         self.max_tokens = max_tokens
-        self.auto_approve = auto_approve
-        self.quiet = quiet
+        self.approve = approve
+        self.on_trace = on_trace
         # THE conversation. Entries: {"role": "user"|"assistant", "content": ...}
         self.messages: list[dict[str, Any]] = []
         self.total_input_tokens = 0
@@ -99,12 +109,16 @@ class Agent:
         turn_in = turn_out = 0
 
         while True:
+            # Once the budget is spent, tool_choice "none" forces a text
+            # answer — the loop is guaranteed to terminate on the next reply.
+            budget_spent = len(records) >= MAX_TOOL_CALLS_PER_TURN
             response = await self.client.messages.create(
                 model=self.model,
                 max_tokens=self.max_tokens,
                 system=self.system_prompt,
                 messages=self.messages,          # the ENTIRE history, every time
                 tools=self.registry.schemas(),   # "these tools exist"
+                tool_choice={"type": "none" if budget_spent else "auto"},
             )
             turn_in += response.usage.input_tokens
             turn_out += response.usage.output_tokens
@@ -115,7 +129,22 @@ class Agent:
             self.messages.append({"role": "assistant", "content": response.content})
 
             if response.stop_reason != "tool_use":
-                break  # the model is done talking — end_turn/max_tokens/refusal
+                # Done talking — end_turn/max_tokens/refusal. But max_tokens
+                # can cut the model off mid-tool-call, leaving tool_use blocks
+                # in content. Every tool_use MUST be answered in the next
+                # message or all later API calls 400 — so answer them here.
+                dangling = [b for b in response.content if b.type == "tool_use"]
+                if dangling:
+                    self.messages.append({"role": "user", "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": b.id,
+                            "content": "Not executed — the response was truncated.",
+                            "is_error": True,
+                        }
+                        for b in dangling
+                    ]})
+                break
 
             # The model may request SEVERAL tools in one reply (parallel
             # calls). Run them all, then send ALL results in ONE user message
@@ -124,8 +153,16 @@ class Agent:
             for block in response.content:
                 if block.type != "tool_use":
                     continue
-                self._trace(block.name, block.input)
-                output, is_error = await self._run_tool(block.name, dict(block.input))
+                if len(records) >= MAX_TOOL_CALLS_PER_TURN:
+                    output, is_error = (
+                        f"Not executed: tool-call limit ({MAX_TOOL_CALLS_PER_TURN}) "
+                        "reached for this turn. Answer with what you have.",
+                        True,
+                    )
+                else:
+                    if self.on_trace is not None:
+                        self.on_trace(block.name, dict(block.input))
+                    output, is_error = await self._run_tool(block.name, dict(block.input))
                 records.append(ToolCallRecord(block.name, dict(block.input), output, is_error))
                 result: dict[str, Any] = {
                     "type": "tool_result",
@@ -157,22 +194,8 @@ class Agent:
     async def _run_tool(self, name: str, tool_input: dict[str, Any]) -> tuple[str, bool]:
         """The permission gate: the model proposes, the harness decides."""
         tool = self.registry.get(name)
-        if tool is not None and tool.requires_approval and not self.auto_approve:
-            if not self._confirm(name, tool_input):
+        if tool is not None and tool.requires_approval and self.approve is not None:
+            if not await self.approve(name, tool_input):
                 # The model sees the denial as an error result and moves on.
                 return "User declined to run this tool.", True
         return await self.registry.execute(name, tool_input)
-
-    def _confirm(self, name: str, tool_input: dict[str, Any]) -> bool:
-        print(f"\n  {name} wants to run:\n    {_summarize(tool_input, limit=500)}")
-        answer = input("  allow? [y/N] ").strip().lower()
-        return answer in ("y", "yes")
-
-    def _trace(self, name: str, tool_input: Any) -> None:
-        if not self.quiet:
-            print(f"  ⏺ {name}({_summarize(dict(tool_input))})")
-
-
-def _summarize(tool_input: dict[str, Any], limit: int = 120) -> str:
-    text = json.dumps(tool_input, ensure_ascii=False)
-    return text if len(text) <= limit else text[: limit - 3] + "..."

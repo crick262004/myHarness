@@ -113,8 +113,13 @@ def build_builtin_tools(workdir: Path) -> list[Tool]:
         try:
             stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=BASH_TIMEOUT_SECONDS)
         except TimeoutError:
-            proc.kill()
             raise ToolError(f"Command timed out after {BASH_TIMEOUT_SECONDS}s: {command}")
+        finally:
+            # Runs on timeout AND on Ctrl-C/cancellation mid-command: kill the
+            # process (or it runs on orphaned) and wait so it's actually reaped.
+            if proc.returncode is None:
+                proc.kill()
+                await proc.wait()
         output = stdout.decode(errors="replace")
         if proc.returncode != 0:
             output += f"\n(exit code {proc.returncode})"

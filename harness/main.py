@@ -6,9 +6,11 @@ Run with:  uv run python -m harness.main
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import sys
 from pathlib import Path
+from typing import Any
 
 import anthropic
 from dotenv import load_dotenv
@@ -31,6 +33,22 @@ def build_system_prompt(workdir: Path) -> str:
     )
 
 
+def console_trace(name: str, tool_input: dict[str, Any]) -> None:
+    text = json.dumps(tool_input, ensure_ascii=False)
+    if len(text) > 120:
+        text = text[:117] + "..."
+    print(f"  ⏺ {name}({text})")
+
+
+async def console_approve(name: str, tool_input: dict[str, Any]) -> bool:
+    # This is a security boundary: show the FULL input, never truncated —
+    # anything hidden past a cutoff is exactly where a bad payload would sit.
+    print(f"\n  {name} wants to run:")
+    for line in json.dumps(tool_input, indent=2, ensure_ascii=False).splitlines():
+        print(f"    {line}")
+    return input("  allow? [y/N] ").strip().lower() in ("y", "yes")
+
+
 def build_registry(workdir: Path) -> ToolRegistry:
     registry = ToolRegistry()
     for tool in build_builtin_tools(workdir):
@@ -51,7 +69,15 @@ async def main() -> None:
     registry = build_registry(workdir)
 
     async with anthropic.AsyncAnthropic() as client:  # picks up ANTHROPIC_API_KEY itself
-        agent = Agent(client, registry, build_system_prompt(workdir), model, max_tokens)
+        agent = Agent(
+            client,
+            registry,
+            build_system_prompt(workdir),
+            model,
+            max_tokens,
+            approve=console_approve,
+            on_trace=console_trace,
+        )
 
         print(f"MyHarness · {model} · /tools lists tools · /clear wipes history · /exit quits")
         while True:
