@@ -18,6 +18,7 @@ dev = [
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["evals/deterministic"]
+pythonpath = ["."]
 markers = [
     "api: eval hits the real Anthropic API (skipped when ANTHROPIC_API_KEY is unset)",
 ]

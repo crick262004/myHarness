@@ -16,6 +16,7 @@ That loop is the whole trick behind every agent product.
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable
 
@@ -149,29 +150,8 @@ class Agent:
             # The model may request SEVERAL tools in one reply (parallel
             # calls). Run them all, then send ALL results in ONE user message
             # — splitting them across messages trains it to stop parallelizing.
-            results: list[dict[str, Any]] = []
-            for block in response.content:
-                if block.type != "tool_use":
-                    continue
-                if len(records) >= MAX_TOOL_CALLS_PER_TURN:
-                    output, is_error = (
-                        f"Not executed: tool-call limit ({MAX_TOOL_CALLS_PER_TURN}) "
-                        "reached for this turn. Answer with what you have.",
-                        True,
-                    )
-                else:
-                    if self.on_trace is not None:
-                        self.on_trace(block.name, dict(block.input))
-                    output, is_error = await self._run_tool(block.name, dict(block.input))
-                records.append(ToolCallRecord(block.name, dict(block.input), output, is_error))
-                result: dict[str, Any] = {
-                    "type": "tool_result",
-                    "tool_use_id": block.id,  # ties this result to that request
-                    "content": output,
-                }
-                if is_error:
-                    result["is_error"] = True
-                results.append(result)
+            tool_uses = [b for b in response.content if b.type == "tool_use"]
+            results = await self._run_tools(tool_uses, records)
             self.messages.append({"role": "user", "content": results})
 
         self.total_input_tokens += turn_in
@@ -191,11 +171,81 @@ class Agent:
             output_tokens=turn_out,
         )
 
-    async def _run_tool(self, name: str, tool_input: dict[str, Any]) -> tuple[str, bool]:
+    async def _run_tools(
+        self, blocks: list[Any], records: list[ToolCallRecord]
+    ) -> list[dict[str, Any]]:
+        """Run one reply's tool calls; return their tool_results in request order.
+
+        Pass 1 (one at a time) settles what can't run: over budget, or declined
+        by the user — a human can only answer one y/N prompt at a time.
+        Pass 2 runs the rest in groups from _schedule: a group of reads goes
+        out together via asyncio.gather, so the reply waits for the slowest
+        read instead of the sum of all of them.
+        """
+        outcomes: list[tuple[str, bool] | None] = [None] * len(blocks)
+        for i, block in enumerate(blocks):
+            if len(records) + i >= MAX_TOOL_CALLS_PER_TURN:
+                outcomes[i] = (
+                    f"Not executed: tool-call limit ({MAX_TOOL_CALLS_PER_TURN}) "
+                    "reached for this turn. Answer with what you have.",
+                    True,
+                )
+                continue
+            if self.on_trace is not None:
+                self.on_trace(block.name, dict(block.input))
+            if not await self._approved(block.name, dict(block.input)):
+                # The model sees the denial as an error result and moves on.
+                outcomes[i] = ("User declined to run this tool.", True)
+
+        for group in self._schedule(blocks, outcomes):
+            done = await asyncio.gather(
+                *(self.registry.execute(blocks[i].name, dict(blocks[i].input)) for i in group)
+            )
+            for i, outcome in zip(group, done):
+                outcomes[i] = outcome
+
+        results: list[dict[str, Any]] = []
+        for block, outcome in zip(blocks, outcomes):
+            assert outcome is not None  # every call was settled in pass 1 or 2
+            output, is_error = outcome
+            records.append(ToolCallRecord(block.name, dict(block.input), output, is_error))
+            result: dict[str, Any] = {
+                "type": "tool_result",
+                "tool_use_id": block.id,  # ties this result to that request
+                "content": output,
+            }
+            if is_error:
+                result["is_error"] = True
+            results.append(result)
+        return results
+
+    def _schedule(
+        self, blocks: list[Any], outcomes: list[tuple[str, bool] | None]
+    ) -> list[list[int]]:
+        """Group the still-pending calls (by index) into execution steps, in order.
+
+        Back-to-back concurrency-safe calls share one group and run together.
+        Every other call gets a group of its own. So [read, read, edit, read]
+        becomes [[0, 1], [2], [3]]: the edit waits for both reads, and the last
+        read waits for the edit, exactly as if run one by one — only faster.
+        """
+        groups: list[list[int]] = []
+        joinable = False  # can the next safe call join groups[-1]?
+        for i, block in enumerate(blocks):
+            if outcomes[i] is not None:
+                continue
+            tool = self.registry.get(block.name)
+            safe = tool is not None and tool.concurrency_safe
+            if safe and joinable:
+                groups[-1].append(i)
+            else:
+                groups.append([i])
+            joinable = safe
+        return groups
+
+    async def _approved(self, name: str, tool_input: dict[str, Any]) -> bool:
         """The permission gate: the model proposes, the harness decides."""
         tool = self.registry.get(name)
-        if tool is not None and tool.requires_approval and self.approve is not None:
-            if not await self.approve(name, tool_input):
-                # The model sees the denial as an error result and moves on.
-                return "User declined to run this tool.", True
-        return await self.registry.execute(name, tool_input)
+        if tool is None or not tool.requires_approval or self.approve is None:
+            return True
+        return await self.approve(name, tool_input)

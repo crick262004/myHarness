@@ -62,6 +62,7 @@ def bridge_tool(
     input_schema: dict[str, Any],
     session: ClientSession,
     requires_approval: bool,
+    read_only: bool = False,
 ) -> Tool:
     """Wrap one MCP tool as a native Tool — the agent can't tell the difference.
 
@@ -93,6 +94,7 @@ def bridge_tool(
         # Default off: fine for read-only servers, set it for anything that
         # writes or sends.
         requires_approval=requires_approval,
+        concurrency_safe=read_only,
     )
 
 
@@ -143,10 +145,15 @@ class MCPManager:
             listing = await session.list_tools()
             approval = bool(spec.get("requiresApproval", False))
             for mcp_tool in listing.tools:
+                # Servers can self-declare read-only tools (an MCP annotation).
+                # It's the server's claim, so it only buys concurrency — never
+                # a pass on the approval gate.
+                annotations = mcp_tool.annotations
                 registry.register(
                     bridge_tool(
                         name, mcp_tool.name, mcp_tool.description,
                         mcp_tool.input_schema, session, requires_approval=approval,
+                        read_only=bool(annotations and annotations.read_only_hint),
                     )
                 )
             self.tool_counts[name] = len(listing.tools)

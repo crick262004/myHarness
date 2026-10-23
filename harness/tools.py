@@ -34,6 +34,9 @@ class Tool:
     input_schema: dict[str, Any]
     handler: Handler
     requires_approval: bool = False
+    # Safe to run at the same time as other calls: it only reads, so order
+    # can't matter. Anything that writes stays serialized.
+    concurrency_safe: bool = False
 
 
 class ToolRegistry:
@@ -184,6 +187,7 @@ def build_builtin_tools(workdir: Path) -> list[Tool]:
                 "required": ["path"],
             },
             handler=read_file,
+            concurrency_safe=True,
         ),
         Tool(
             name="write_file",
