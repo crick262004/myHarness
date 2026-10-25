@@ -17,6 +17,7 @@ That loop is the whole trick behind every agent product.
 from __future__ import annotations
 
 import asyncio
+import logging
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable
 
@@ -36,8 +37,11 @@ from .compaction import (
     summary_messages,
     turn_starts,
 )
+from .memory import Memory, MemoryStore, format_memories, recalled_ids
 from .permissions import Policy
 from .tools import ToolRegistry
+
+log = logging.getLogger(__name__)
 
 # Safety valve: total tool executions allowed in ONE user turn, summed across
 # every loop iteration (not per-reply parallelism). A model stuck in a tool
@@ -112,6 +116,7 @@ class TurnResult:
     stop_reason: str | None
     tool_calls: list[ToolCallRecord] = field(default_factory=list)
     usage: TokenUsage = field(default_factory=TokenUsage)
+    memories: list[Memory] = field(default_factory=list)  # notes added to the user message
 
     def tool_names(self) -> list[str]:
         return [call.name for call in self.tool_calls]
@@ -132,6 +137,7 @@ class Agent:
         on_text: TextFn | None = None,
         compact_at: int | None = None,
         on_compact: CompactFn | None = None,
+        memory: MemoryStore | None = None,
     ) -> None:
         self.client = client
         self.registry = registry
@@ -148,6 +154,8 @@ class Agent:
         # (None = never automatically).
         self.compact_at = compact_at
         self.on_compact = on_compact
+        # Long-term notes; relevant ones are added to each user message.
+        self.memory = memory
         # THE conversation. Entries: {"role": "user"|"assistant", "content": ...}
         self.messages: list[dict[str, Any]] = []
         self.usage = TokenUsage()    # whole session, side calls included
@@ -228,7 +236,13 @@ class Agent:
             raise
 
     async def _turn(self, user_input: str) -> TurnResult:
-        self.messages.append({"role": "user", "content": user_input})
+        # Notes go into THIS message, never the system prompt: the system
+        # prompt starts the cached prefix, so changing it every turn would
+        # miss the cache on every call. Kept in history as sent, so later
+        # calls read it back from the cache too.
+        memories = await self._recall(user_input)
+        content = f"{format_memories(memories)}\n\n{user_input}" if memories else user_input
+        self.messages.append({"role": "user", "content": content})
         records: list[ToolCallRecord] = []
         turn_usage = TokenUsage()
 
@@ -286,7 +300,20 @@ class Agent:
             stop_reason=response.stop_reason,
             tool_calls=records,
             usage=turn_usage,
+            memories=memories,
         )
+
+    async def _recall(self, query: str) -> list[Memory]:
+        """Stored notes relevant to this message that the context doesn't hold yet."""
+        if self.memory is None:
+            return []
+        try:
+            found = await self.memory.search(query)
+        except Exception as exc:  # noqa: BLE001 — memory helps; it must never block a turn
+            log.warning("memory search failed: %s", exc)
+            return []
+        shown = recalled_ids(self.messages)
+        return [m for m in found if m.id not in shown]
 
     async def _call_model(self, tool_choice: str) -> Any:
         """One model call, streamed: text reaches on_text as it is generated.

@@ -53,9 +53,12 @@ def path_matches(path: Path, patterns: tuple[str, ...]) -> bool:
 
 # Used when no rule matches: anything unlisted (new built-ins, every MCP tool)
 # asks. Trust is something you grant on purpose, in permissions.json.
+# remember/forget ask too: a web page could talk the model into saving an
+# instruction that then comes back in every future session.
 DEFAULT_RULES = (
     Rule("*", "deny", SECRET_PATHS),
     Rule("read_file", "allow"),
+    Rule("recall", "allow"),
 )
 
 

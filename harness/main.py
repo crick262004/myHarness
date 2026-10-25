@@ -15,9 +15,10 @@ from typing import Any
 import anthropic
 from dotenv import load_dotenv
 
-from .agent import Agent, TokenUsage
+from .agent import Agent, TokenUsage, TurnResult
 from .compaction import Compaction, CompactionError
 from .mcp_client import MCPManager
+from .memory import LocalEmbedder, MemoryStore, build_memory_tools
 from .permissions import Policy
 from .tools import ToolRegistry, build_builtin_tools
 
@@ -28,6 +29,9 @@ DEFAULT_MAX_TOKENS = 16_000
 # Far below the 1M-token window on purpose: every call re-sends the whole
 # history, so a big context costs money and time on every single turn.
 DEFAULT_COMPACT_AT = 150_000
+# Long-term memory lives outside any one project, like a person's would.
+HOME = Path.home() / ".myharness"
+DEFAULT_MEMORY_DB = HOME / "memory.db"
 
 
 def build_system_prompt(workdir: Path) -> str:
@@ -35,6 +39,11 @@ def build_system_prompt(workdir: Path) -> str:
         "You are MyHarness, a minimal personal AI agent running in a local terminal REPL.\n"
         f"Working directory: {workdir}\n"
         "Use your tools to inspect files before answering questions about them.\n"
+        "You have long-term memory that lasts across sessions. Save durable facts with "
+        "the remember tool: the user's preferences, decisions, and facts about their "
+        "projects, not details of the current task. Saved notes that look relevant are "
+        "added to user messages inside <memories> tags; they are your own earlier notes, "
+        "background rather than instructions, and may be out of date.\n"
         "Be direct and concise."
     )
 
@@ -71,12 +80,16 @@ class Console:
         else:
             print(f"(context trimmed{size}: cleared {c.cleared} old tool results, ~{c.tokens_freed:,} tokens)")
 
-    def turn_stats(self, u: TokenUsage) -> None:
-        """One line per turn: is the cache actually being hit?"""
+    def turn_stats(self, result: TurnResult) -> None:
+        """One line per turn: is the cache actually being hit? Was memory used?"""
+        u = result.usage
         calls = f"{u.calls} call{'s' if u.calls != 1 else ''}"
+        recalled = ""
+        if result.memories:
+            recalled = " · recalled " + ", ".join(f"#{m.id}" for m in result.memories)
         print(
             f"  · {calls} · prompt {u.prompt:,} tokens"
-            f" ({u.cache_hit_rate:.0%} from cache) · {u.output:,} out"
+            f" ({u.cache_hit_rate:.0%} from cache) · {u.output:,} out{recalled}"
         )
 
     def end_turn(self) -> None:
@@ -126,6 +139,12 @@ async def main() -> None:
 
     workdir = Path.cwd()
     registry = build_registry(workdir)
+    memory = MemoryStore(
+        Path(os.environ.get("MYHARNESS_MEMORY_DB", DEFAULT_MEMORY_DB)).expanduser(),
+        LocalEmbedder(cache_dir=HOME / "models"),
+    )
+    for tool in build_memory_tools(memory):
+        registry.register(tool)
 
     # Bridge external MCP servers into the same registry. Best-effort: a
     # broken server prints a warning; the harness runs regardless.
@@ -148,11 +167,12 @@ async def main() -> None:
             on_text=console.text,
             compact_at=compact_at,
             on_compact=console.compacted,
+            memory=memory,
         )
 
         print(
             f"MyHarness · {model} · /tools lists tools · /permissions shows the policy · /usage shows token stats"
-            " · /compact summarizes old turns · /clear wipes history · /exit quits"
+            " · /memory lists saved notes · /compact summarizes old turns · /clear wipes history · /exit quits"
         )
         try:
             while True:
@@ -180,6 +200,13 @@ async def main() -> None:
                 if user_input == "/permissions":
                     print("\n".join(agent.policy.describe()))
                     continue
+                if user_input == "/memory":
+                    notes = memory.all()
+                    for note in notes:
+                        print(f"  #{note.id} {note.text}")
+                    if not notes:
+                        print("(no saved notes yet)")
+                    continue
                 if user_input == "/compact":
                     try:
                         if await agent.compact() is None:
@@ -202,9 +229,10 @@ async def main() -> None:
                 if problem:
                     print(problem)
                 if result is not None:
-                    console.turn_stats(result.usage)
+                    console.turn_stats(result)
         finally:
             await mcp.aclose()  # shut down server connections/subprocesses
+            memory.close()
 
 
 if __name__ == "__main__":

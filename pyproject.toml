@@ -8,6 +8,8 @@ dependencies = [
     "mcp>=1.0.0",
     "jsonschema>=4.0",
     "python-dotenv>=1.2.2",
+    "fastembed>=0.9.1",
+    "numpy>=2.4.6",
 ]
 
 [dependency-groups]
