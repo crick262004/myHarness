@@ -11,17 +11,31 @@ The model never executes anything. It only *asks*; the harness decides and runs.
 from __future__ import annotations
 
 import asyncio
+import os
+import re
+from collections.abc import Iterator
 from dataclasses import dataclass
+from fnmatch import fnmatch
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 from jsonschema import validators
 from jsonschema.exceptions import SchemaError, best_match
 
+from .permissions import SECRET_PATHS, path_matches
+
 # Tool output is unbounded, untrusted text; cap it so one giant file or a
 # runaway command can't flood the context window.
 MAX_OUTPUT_CHARS = 50_000
 BASH_TIMEOUT_SECONDS = 120
+MAX_LISTED = 500         # list_files entries
+MAX_MATCHES = 100        # search_files matching lines
+MAX_SEARCH_BYTES = 1_000_000  # bigger files are skipped: logs, data, bundles
+# Never walked into: tool caches and installed packages, not the user's work.
+SKIP_DIRS = {
+    ".git", ".venv", "venv", "node_modules", "__pycache__",
+    ".pytest_cache", ".mypy_cache", ".ruff_cache", ".tox",
+}
 
 Handler = Callable[[dict[str, Any]], Awaitable[str]]
 
@@ -126,6 +140,59 @@ def resolve_path(workdir: Path, raw: str) -> Path:
     return resolved
 
 
+def walk_files(workdir: Path, base: Path, name_pattern: str) -> Iterator[Path]:
+    """Files under `base` whose name matches, sorted, skipping SKIP_DIRS.
+
+    Symlinked directories are not followed, and a file that resolves outside
+    the working directory (a symlink pointing out) is skipped.
+    """
+    if base.is_file():
+        candidates: Iterator[Path] = iter([base])
+    else:
+        candidates = _walk(base)
+    for path in candidates:
+        if fnmatch(path.name, name_pattern) and path.resolve().is_relative_to(workdir):
+            yield path
+
+
+def _walk(base: Path) -> Iterator[Path]:
+    for root, dirs, files in os.walk(base):
+        dirs[:] = sorted(d for d in dirs if d not in SKIP_DIRS)  # prune in place
+        for name in sorted(files):
+            yield Path(root) / name
+
+
+def list_files_sync(workdir: Path, base: Path, pattern: str) -> str:
+    listed = []
+    for path in walk_files(workdir, base, pattern):
+        if len(listed) == MAX_LISTED:
+            listed.append(f"... (stopped at {MAX_LISTED} files; narrow the path or pattern)")
+            break
+        listed.append(str(path.relative_to(workdir)))
+    return "\n".join(listed) or "(no matching files)"
+
+
+def search_files_sync(workdir: Path, base: Path, regex: re.Pattern[str], pattern: str) -> str:
+    matches = []
+    for path in walk_files(workdir, base, pattern):
+        # Same secret list as the policy: grep must not become a way to read .env.
+        if path_matches(path.resolve(), SECRET_PATHS):
+            continue
+        try:
+            if path.stat().st_size > MAX_SEARCH_BYTES:
+                continue
+            text = path.read_text()
+        except (UnicodeDecodeError, OSError):
+            continue  # binary, unreadable or a broken link: not searchable text
+        for number, line in enumerate(text.splitlines(), 1):
+            if regex.search(line):
+                if len(matches) == MAX_MATCHES:
+                    matches.append(f"... (stopped at {MAX_MATCHES} matches; narrow the search)")
+                    return "\n".join(matches)
+                matches.append(f"{path.relative_to(workdir)}:{number}: {line.strip()[:200]}")
+    return "\n".join(matches) or "(no matches)"
+
+
 def build_builtin_tools(workdir: Path) -> list[Tool]:
     workdir = workdir.resolve()
 
@@ -158,6 +225,29 @@ def build_builtin_tools(workdir: Path) -> list[Tool]:
         if not path.is_file():
             raise ToolError(f"File not found: {tool_input['path']}")
         return path.read_text(errors="replace")
+
+    def existing(raw: str) -> Path:
+        path = resolve_path(workdir, raw)
+        if not path.exists():
+            raise ToolError(f"Not found: {raw}")
+        return path
+
+    async def list_files(tool_input: dict[str, Any]) -> str:
+        base = existing(tool_input.get("path", "."))
+        # A big tree takes a moment to walk: off the event loop.
+        return await asyncio.to_thread(
+            list_files_sync, workdir, base, tool_input.get("pattern", "*")
+        )
+
+    async def search_files(tool_input: dict[str, Any]) -> str:
+        base = existing(tool_input.get("path", "."))
+        try:
+            regex = re.compile(tool_input["regex"])
+        except re.error as exc:
+            raise ToolError(f"Invalid regex: {exc}")
+        return await asyncio.to_thread(
+            search_files_sync, workdir, base, regex, tool_input.get("pattern", "*")
+        )
 
     async def write_file(tool_input: dict[str, Any]) -> str:
         path = resolve_path(workdir, tool_input["path"])
@@ -211,6 +301,42 @@ def build_builtin_tools(workdir: Path) -> list[Tool]:
                 "required": ["path"],
             },
             handler=read_file,
+            concurrency_safe=True,
+        ),
+        Tool(
+            name="list_files",
+            description=(
+                "List files under a directory, recursively, as paths relative to the "
+                "working directory. Skips .git, .venv, node_modules and caches. Call this "
+                "to find files by name before reading them."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Directory to list (default: the working directory)."},
+                    "pattern": {"type": "string", "description": "Glob on the file name, e.g. '*.py' (default: all files)."},
+                },
+            },
+            handler=list_files,
+            concurrency_safe=True,
+        ),
+        Tool(
+            name="search_files",
+            description=(
+                "Search file contents for a regular expression, recursively. Returns "
+                "matching lines as path:line: text. Call this to find where something is "
+                "defined or used."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "regex": {"type": "string", "minLength": 1, "description": "Python regular expression, matched per line."},
+                    "path": {"type": "string", "description": "File or directory to search (default: the working directory)."},
+                    "pattern": {"type": "string", "description": "Only search files whose name matches this glob, e.g. '*.py'."},
+                },
+                "required": ["regex"],
+            },
+            handler=search_files,
             concurrency_safe=True,
         ),
         Tool(

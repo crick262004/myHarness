@@ -58,6 +58,8 @@ def path_matches(path: Path, patterns: tuple[str, ...]) -> bool:
 DEFAULT_RULES = (
     Rule("*", "deny", SECRET_PATHS),
     Rule("read_file", "allow"),
+    Rule("list_files", "allow"),
+    Rule("search_files", "allow"),  # skips secret files itself, like the rule above
     Rule("recall", "allow"),
 )
 
