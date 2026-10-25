@@ -23,6 +23,7 @@ from jsonschema import validators
 from jsonschema.exceptions import SchemaError, best_match
 
 from .permissions import SECRET_PATHS, path_matches
+from .sandbox import Sandbox, scrubbed_env
 
 # Tool output is unbounded, untrusted text; cap it so one giant file or a
 # runaway command can't flood the context window.
@@ -197,18 +198,25 @@ def search_files_sync(workdir: Path, base: Path, regex: re.Pattern[str], pattern
     return "\n".join(matches) or "(no matches)"
 
 
-def build_builtin_tools(workdir: Path) -> list[Tool]:
+def build_builtin_tools(workdir: Path, sandbox: Sandbox | None = None) -> list[Tool]:
+    """The built-in tools. With a sandbox, bash runs inside it (see sandbox.py)."""
     workdir = workdir.resolve()
 
     async def bash(tool_input: dict[str, Any]) -> str:
         command = tool_input["command"]
-        proc = await asyncio.create_subprocess_shell(
-            command,
+        streams: dict[str, Any] = dict(
             cwd=workdir,
             stdin=asyncio.subprocess.DEVNULL,  # a command that prompts fails fast instead of hanging
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,  # one interleaved stream, like a terminal
         )
+        if sandbox is not None:
+            proc = await asyncio.create_subprocess_exec(
+                *sandbox.wrap(workdir, command), env=sandbox.env(), **streams
+            )
+        else:
+            # No OS sandbox, but API keys still stay out of the command's reach.
+            proc = await asyncio.create_subprocess_shell(command, env=scrubbed_env(), **streams)
         try:
             stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=BASH_TIMEOUT_SECONDS)
         except TimeoutError:
@@ -281,6 +289,12 @@ def build_builtin_tools(workdir: Path) -> list[Tool]:
                 "Run a shell command in the working directory and return its combined "
                 "stdout/stderr. Call this to explore the filesystem, run programs, or "
                 "use CLI tools. Commands time out after 120 seconds."
+                + (
+                    " Commands run in a sandbox: they can't read secret files (.env, keys) "
+                    "or write outside the working directory and temp folders; that shows "
+                    "up as 'Operation not permitted'."
+                    if sandbox is not None else ""
+                )
             ),
             input_schema={
                 "type": "object",

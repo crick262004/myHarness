@@ -22,6 +22,7 @@ from .llm import LLMError
 from .mcp_client import MCPManager
 from .memory import LocalEmbedder, MemoryStore, build_memory_tools
 from .permissions import Policy
+from .sandbox import Sandbox
 from .subagents import build_delegate_tool, subagent_prompt
 from .workflows import describe_step, run_research
 from .tools import ToolRegistry, build_builtin_tools
@@ -133,9 +134,9 @@ def print_usage(u: TokenUsage) -> None:
     print(f"  input cost vs. no caching: {u.input_cost_saved:.0%} cheaper")
 
 
-def build_registry(workdir: Path) -> ToolRegistry:
+def build_registry(workdir: Path, sandbox: Sandbox | None = None) -> ToolRegistry:
     registry = ToolRegistry()
-    for tool in build_builtin_tools(workdir):
+    for tool in build_builtin_tools(workdir, sandbox):
         registry.register(tool)
     return registry
 
@@ -151,7 +152,12 @@ async def main() -> None:
     compact_at = int(os.environ.get("MYHARNESS_COMPACT_AT", DEFAULT_COMPACT_AT)) or None  # 0 = off
 
     workdir = Path.cwd()
-    registry = build_registry(workdir)
+    sandbox = None if os.environ.get("MYHARNESS_SANDBOX") == "0" else Sandbox.default()
+    if sandbox is not None:
+        print("(sandbox) bash runs under macOS Seatbelt: no secret files, writes only here and in temp")
+    else:
+        print("(sandbox) OFF: bash can read and write anything you can; only the y/N prompt guards it")
+    registry = build_registry(workdir, sandbox)
     memory = MemoryStore(
         Path(os.environ.get("MYHARNESS_MEMORY_DB", DEFAULT_MEMORY_DB)).expanduser(),
         LocalEmbedder(cache_dir=HOME / "models"),
