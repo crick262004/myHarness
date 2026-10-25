@@ -37,7 +37,7 @@ from .compaction import (
     summary_messages,
     turn_starts,
 )
-from .memory import Memory, MemoryStore, format_memories, recalled_ids
+from .memory import AUTO_RECALL_K, Memory, MemoryStore, format_memories, recalled_ids
 from .permissions import Policy
 from .tools import ToolRegistry
 
@@ -345,7 +345,7 @@ class Agent:
         if self.memory is None:
             return []
         try:
-            found = await self.memory.search(query)
+            found = await self.memory.search(query, k=AUTO_RECALL_K)
         except Exception as exc:  # noqa: BLE001 — memory helps; it must never block a turn
             log.warning("memory search failed: %s", exc)
             return []

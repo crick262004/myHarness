@@ -25,7 +25,7 @@ from typing import Callable
 from .agent import Agent, TokenUsage
 from .graph import END, START, Graph, State, Step
 from .llm import ask_json, ask_text
-from .memory import MemoryStore
+from .memory import AUTO_RECALL_K, MemoryStore
 from .subagents import run_subagent
 
 log = logging.getLogger(__name__)
@@ -109,7 +109,7 @@ def build_research_graph(
         if memory is None:
             return {"notes": []}
         try:
-            found = await memory.search(state["question"])
+            found = await memory.search(state["question"], k=AUTO_RECALL_K)
         except Exception as exc:  # noqa: BLE001 — as in the agent: memory never blocks a run
             log.warning("memory search failed: %s", exc)
             found = []

@@ -26,7 +26,12 @@ import numpy as np
 
 from .tools import Tool, ToolError
 
-TOP_K = 5                # most notes added to one user message
+TOP_K = 5                # most notes the recall tool returns by default
+# Most notes added to a user message unasked. Measured by evals/retrieval.py:
+# the 2nd-5th closest notes were mostly noise (top 5: 44% of added notes
+# relevant; top 1: 100%, finding the same 79% of relevant notes). The model
+# can still use the recall tool when it wants more.
+AUTO_RECALL_K = 1
 DUPLICATE_SCORE = 0.95   # this close to an existing note = the same fact again
 
 
@@ -44,8 +49,9 @@ class LocalEmbedder:
 
     def __init__(self, cache_dir: Path, model: str = "BAAI/bge-small-en-v1.5") -> None:
         self.name = model
-        # bge-small scores related text ~0.7 and unrelated ~0.5 (measured).
-        self.min_score = 0.6
+        # Chosen by `python -m evals.retrieval` (best F0.5 for bge-small with
+        # AUTO_RECALL_K=1). Another model needs its own: scores aren't comparable.
+        self.min_score = 0.575
         self._cache_dir = cache_dir  # fastembed's default is /tmp, gone after a reboot
         self._model: Any = None
         self._lock = threading.Lock()  # embed() runs in worker threads

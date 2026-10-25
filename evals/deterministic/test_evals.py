@@ -132,7 +132,18 @@ async def test_calibration_measures_agreement_with_known_verdicts():
     replies[0] = verdicts(not first[0], *first[1:])  # the judge gets one verdict wrong
     total = sum(len(case["expected"]) for case in CALIBRATION)
 
-    agreement, misses = await calibrate(Judge(ScriptedClient(*replies), "j"))
+    result = await calibrate(Judge(ScriptedClient(*replies), "j"))
 
-    assert agreement == (total - 1) / total
-    assert len(misses) == 1 and misses[0].startswith(CALIBRATION[0]["id"])
+    assert result.agreement == (total - 1) / total and result.verdicts == total
+    assert len(result.misses) == 1 and result.misses[0].startswith(CALIBRATION[0]["id"])
+    assert result.errors == []
+
+
+async def test_a_refused_calibration_case_is_reported_not_fatal():
+    replies = [verdicts(*case["expected"]) for case in CALIBRATION]
+    replies[1] = reply(stop_reason="refusal")
+    result = await calibrate(Judge(ScriptedClient(*replies), "j"))
+
+    assert result.agreement == 1.0
+    assert result.errors == [f"{CALIBRATION[1]['id']}: LLMError: the model declined"]
+    assert result.verdicts == sum(len(c["expected"]) for c in CALIBRATION) - len(CALIBRATION[1]["expected"])

@@ -270,10 +270,13 @@ async def main() -> None:
     async with anthropic.AsyncAnthropic(max_retries=4) as client:  # parallel runs meet rate limits
         judge = None if args.no_judge else Judge(client, args.judge)
         if args.calibrate:
-            agreement, misses = await calibrate(Judge(client, args.judge))
-            print(f"judge {args.judge}: {agreement:.0%} agreement with known verdicts")
-            for miss in misses:
+            result = await calibrate(Judge(client, args.judge), trials=args.trials)
+            print(f"judge {args.judge}: {result.agreement:.0%} agreement with known verdicts"
+                  f" ({result.verdicts} verdicts, {args.trials} trial{'s' if args.trials != 1 else ''})")
+            for miss in result.misses:
                 print(f"  ✗ {miss}")
+            for error in result.errors:
+                print(f"  ! couldn't grade {error}")
             return
 
         print(f"{len(models)} models × {len(cases)} cases × {args.trials} trials"
