@@ -248,6 +248,7 @@ def build_memory_tools(store: MemoryStore) -> list[Tool]:
             },
             handler=recall,
             concurrency_safe=True,
+            read_only=True,
         ),
         Tool(
             name="forget",

@@ -66,7 +66,8 @@ def bridge_tool(
     """Wrap one MCP tool as a native Tool — the agent can't tell the difference.
 
     Namespacing (mcp__server__tool) keeps two servers' tools from colliding
-    with each other or with built-ins.
+    with each other or with built-ins. A read-only tool (only reads, from a
+    trusted server's hint) may run in parallel and be given to sub-agents.
     """
 
     async def handler(tool_input: dict[str, Any]) -> str:
@@ -90,6 +91,7 @@ def bridge_tool(
         input_schema=input_schema,
         handler=handler,
         concurrency_safe=read_only,
+        read_only=read_only,
     )
 
 
@@ -99,6 +101,7 @@ class MCPManager:
     def __init__(self) -> None:
         self._stacks: dict[str, AsyncExitStack] = {}
         self.tool_counts: dict[str, int] = {}   # server -> number of tools bridged
+        self.read_only_counts: dict[str, int] = {}  # server -> how many count as read-only
         self.failures: dict[str, str] = {}      # server -> why it didn't connect
 
     async def connect_all(self, config_path: Path, registry: ToolRegistry) -> None:
@@ -138,19 +141,25 @@ class MCPManager:
             session = await stack.enter_async_context(ClientSession(read, write))
             await session.initialize()
             listing = await session.list_tools()
+            # Servers can self-declare read-only tools (an MCP annotation).
+            # That's only the server's claim, and the MCP spec says not to
+            # act on hints from untrusted servers. So it counts only if this
+            # server's config entry says "trustReadOnlyHints": true. Even
+            # then it never bypasses the permission policy.
+            trusted = spec.get("trustReadOnlyHints", False) is True
+            read_only = 0
             for mcp_tool in listing.tools:
-                # Servers can self-declare read-only tools (an MCP annotation).
-                # It's the server's claim, so it only buys concurrency — never
-                # a pass on the permission policy.
                 annotations = mcp_tool.annotations
+                hint = trusted and bool(annotations and annotations.read_only_hint)
+                read_only += hint
                 registry.register(
                     bridge_tool(
                         name, mcp_tool.name, mcp_tool.description,
-                        mcp_tool.input_schema, session,
-                        read_only=bool(annotations and annotations.read_only_hint),
+                        mcp_tool.input_schema, session, read_only=hint,
                     )
                 )
             self.tool_counts[name] = len(listing.tools)
+            self.read_only_counts[name] = read_only
         except BaseException:
             await stack.aclose()  # tear down whatever half-connected
             raise
@@ -159,6 +168,7 @@ class MCPManager:
     def status_lines(self) -> list[str]:
         lines = [
             f"(mcp) {name}: {count} tool{'s' if count != 1 else ''} bridged"
+            f" ({self.read_only_counts.get(name, 0)} read-only)"
             for name, count in self.tool_counts.items()
         ]
         lines += [f"(mcp) {name}: FAILED — {reason}" for name, reason in self.failures.items()]

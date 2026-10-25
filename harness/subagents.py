@@ -7,9 +7,11 @@ only needs a summary of. A sub-agent does that work in its own, empty
 history and hands back only its final reply, so the parent pays for one
 tool call and a short report instead of all the raw material.
 
-Sub-agents get only the read-only tools, and no delegate tool:
-  - read-only, so several can run at once (delegate is concurrency-safe)
-    and none can change anything behind the parent's back;
+Sub-agents get only tools that are both read-only and concurrency-safe,
+and no delegate tool:
+  - read-only, so none can change anything behind the parent's back;
+  - concurrency-safe, so several sub-agents can run at once (delegate is
+    concurrency-safe) without tripping over each other;
   - no delegate, so a sub-agent can't spawn sub-agents of its own.
 Their tool calls still pass the parent's permission policy: delegating is
 never a way around it.
@@ -39,12 +41,12 @@ def subagent_prompt(workdir: Path) -> str:
     )
 
 
-def read_only_tools(registry: ToolRegistry) -> ToolRegistry:
-    """The parent's concurrency-safe (read-only) tools, minus delegate itself."""
+def subagent_tools(registry: ToolRegistry) -> ToolRegistry:
+    """The parent's read-only, concurrency-safe tools, minus delegate itself."""
     child = ToolRegistry()
     for name in registry.names():
         tool = registry.get(name)
-        if tool is not None and tool.concurrency_safe and name != DELEGATE:
+        if tool is not None and tool.read_only and tool.concurrency_safe and name != DELEGATE:
             child.register(tool)
     return child
 
@@ -66,7 +68,7 @@ async def run_subagent(
     """
     child = Agent(
         parent.client,
-        read_only_tools(parent.registry),
+        subagent_tools(parent.registry),
         system_prompt,
         model or parent.model,
         parent.max_tokens,
@@ -124,4 +126,5 @@ def build_delegate_tool(parent: Agent, system_prompt: str, model: str | None = N
         },
         handler=delegate,
         concurrency_safe=True,
+        read_only=True,  # its sub-agent can only read
     )

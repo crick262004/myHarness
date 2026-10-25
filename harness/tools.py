@@ -50,9 +50,13 @@ class Tool:
     description: str
     input_schema: dict[str, Any]
     handler: Handler
-    # Safe to run at the same time as other calls: it only reads, so order
-    # can't matter. Anything that writes stays serialized.
+    # Two separate questions, set separately:
+    # Safe to run at the same time as other calls? Order can't matter and
+    # nothing shared gets tripped over. Anything else runs one at a time.
     concurrency_safe: bool = False
+    # Changes nothing at all (files, memory, the outside world)? Only these
+    # are handed to sub-agents.
+    read_only: bool = False
 
 
 class ToolRegistry:
@@ -302,6 +306,7 @@ def build_builtin_tools(workdir: Path) -> list[Tool]:
             },
             handler=read_file,
             concurrency_safe=True,
+            read_only=True,
         ),
         Tool(
             name="list_files",
@@ -319,6 +324,7 @@ def build_builtin_tools(workdir: Path) -> list[Tool]:
             },
             handler=list_files,
             concurrency_safe=True,
+            read_only=True,
         ),
         Tool(
             name="search_files",
@@ -338,6 +344,7 @@ def build_builtin_tools(workdir: Path) -> list[Tool]:
             },
             handler=search_files,
             concurrency_safe=True,
+            read_only=True,
         ),
         Tool(
             name="write_file",

@@ -7,8 +7,8 @@ import httpx
 from evals.scripted import ScriptedClient, make_agent, reply, text, tool_use
 from harness.agent import Agent
 from harness.permissions import DEFAULT_RULES, Policy, Rule
-from harness.subagents import build_delegate_tool
-from harness.tools import Tool
+from harness.subagents import build_delegate_tool, subagent_tools
+from harness.tools import Tool, ToolRegistry
 
 
 class Reads:
@@ -25,7 +25,7 @@ class Reads:
             self.now -= 1
             return f"RAW CONTENTS OF {tool_input['path']}"
 
-        return Tool("read", "read", {"type": "object"}, handler, concurrency_safe=True)
+        return Tool("read", "read", {"type": "object"}, handler, concurrency_safe=True, read_only=True)
 
 
 async def _write(tool_input: dict[str, Any]) -> str:
@@ -69,6 +69,22 @@ async def test_subagent_starts_fresh_and_only_its_report_comes_back():
     assert report["content"] == "The answer is 42 (a.txt, line 1)."
     assert "RAW CONTENTS" not in str(agent.messages)  # the raw read stayed in the sub-agent
     assert result.tool_names() == ["delegate"] and result.text == "It's 42."
+
+
+def test_subagents_get_tools_that_are_both_read_only_and_concurrency_safe():
+    registry = ToolRegistry()
+    for name, safe, read_only in [
+        ("both", True, True),
+        ("parallel_writer", True, False),   # e.g. appends to separate files
+        ("serial_reader", False, True),     # e.g. reads a one-at-a-time API
+        ("writer", False, False),
+    ]:
+        registry.register(Tool(name, name, {"type": "object"}, _write,
+                               concurrency_safe=safe, read_only=read_only))
+    parent = with_delegate(make_agent(ScriptedClient(), *(registry.get(n) for n in registry.names())))
+
+    assert parent.registry.get("delegate").read_only  # yet still excluded: no recursion
+    assert subagent_tools(parent.registry).names() == ["both"]
 
 
 async def test_subagent_tokens_are_billed_to_the_parent():
