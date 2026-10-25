@@ -23,6 +23,9 @@ def tool_use(id_: str, name: str, **tool_input: Any) -> ToolUseBlock:
     return ToolUseBlock(type="tool_use", id=id_, name=name, input=tool_input)
 
 
+Scripted = Message | Exception  # an Exception is raised in place of a reply
+
+
 def reply(
     *blocks: TextBlock | ToolUseBlock,
     stop_reason: str | None = None,
@@ -69,7 +72,7 @@ class _ScriptedStream:
 
 
 class _ScriptedMessages:
-    def __init__(self, replies: list[Message]) -> None:
+    def __init__(self, replies: list[Scripted]) -> None:
         self.replies = replies
         self.requests: list[dict[str, Any]] = []
 
@@ -84,11 +87,14 @@ class _ScriptedMessages:
         self.requests.append({**kwargs, "messages": list(kwargs["messages"])})
         if not self.replies:
             raise AssertionError("agent made more API calls than the script has replies")
-        return self.replies.pop(0)
+        nxt = self.replies.pop(0)
+        if isinstance(nxt, Exception):
+            raise nxt
+        return nxt
 
 
 class ScriptedClient:
-    def __init__(self, *replies: Message) -> None:
+    def __init__(self, *replies: Scripted) -> None:
         self.messages = _ScriptedMessages(list(replies))
 
     @property

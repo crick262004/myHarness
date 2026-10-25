@@ -20,6 +20,7 @@ from .compaction import Compaction, CompactionError
 from .mcp_client import MCPManager
 from .memory import LocalEmbedder, MemoryStore, build_memory_tools
 from .permissions import Policy
+from .subagents import build_delegate_tool, subagent_prompt
 from .tools import ToolRegistry, build_builtin_tools
 
 # Application policy lives here, not in the Agent. Values come from the
@@ -169,6 +170,11 @@ async def main() -> None:
             on_compact=console.compacted,
             memory=memory,
         )
+        # Registered last: a sub-agent gets the read-only tools that exist
+        # by now, MCP ones included.
+        registry.register(build_delegate_tool(
+            agent, subagent_prompt(workdir), model=os.environ.get("MYHARNESS_SUBAGENT_MODEL")
+        ))
 
         print(
             f"MyHarness · {model} · /tools lists tools · /permissions shows the policy · /usage shows token stats"

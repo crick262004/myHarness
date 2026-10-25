@@ -90,6 +90,14 @@ class TokenUsage:
         self.output += usage.output_tokens
         self.calls += 1
 
+    def merge(self, other: TokenUsage) -> None:
+        """Add in totals already counted elsewhere (e.g. by a sub-agent)."""
+        self.fresh += other.fresh
+        self.cache_write += other.cache_write
+        self.cache_read += other.cache_read
+        self.output += other.output
+        self.calls += other.calls
+
     @property
     def prompt(self) -> int:
         return self.fresh + self.cache_write + self.cache_read
@@ -159,12 +167,22 @@ class Agent:
         # THE conversation. Entries: {"role": "user"|"assistant", "content": ...}
         self.messages: list[dict[str, Any]] = []
         self.usage = TokenUsage()    # whole session, side calls included
+        self._turn_usage = TokenUsage()  # the turn in progress (or the last one)
         self.last_prompt_tokens = 0  # size of the most recent request, as the API measured it
 
     def clear(self) -> None:
         """Instant amnesia — proves the memory was only ever this list."""
         self.messages = []
         self.last_prompt_tokens = 0
+
+    def bill(self, usage: TokenUsage) -> None:
+        """Count tokens spent on this agent's behalf by another one (a sub-agent).
+
+        They join the session and current-turn totals, but not
+        last_prompt_tokens: the sub-agent's context isn't this one.
+        """
+        self.usage.merge(usage)
+        self._turn_usage.merge(usage)
 
     async def compact(self, keep_turns: int = KEEP_RECENT_TURNS) -> Compaction | None:
         """Replace all but the last `keep_turns` turns with a model-written summary.
@@ -244,7 +262,7 @@ class Agent:
         content = f"{format_memories(memories)}\n\n{user_input}" if memories else user_input
         self.messages.append({"role": "user", "content": content})
         records: list[ToolCallRecord] = []
-        turn_usage = TokenUsage()
+        turn_usage = self._turn_usage = TokenUsage()
 
         while True:
             # Once the budget is spent, tool_choice "none" forces a text

@@ -61,6 +61,9 @@ DEFAULT_RULES = (
     Rule("list_files", "allow"),
     Rule("search_files", "allow"),  # skips secret files itself, like the rule above
     Rule("recall", "allow"),
+    # A sub-agent only has read-only tools, and each of its calls passes this
+    # same policy, so starting one needs no extra approval.
+    Rule("delegate", "allow"),
 )
 
 
