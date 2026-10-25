@@ -1,9 +1,8 @@
 import asyncio
 from typing import Any
 
-from evals.scripted import ScriptedClient, reply, text, tool_use
-from harness.agent import Agent
-from harness.tools import Tool, ToolRegistry
+from evals.scripted import ScriptedClient, make_agent, reply, text, tool_use
+from harness.tools import Tool
 
 
 class Probe:
@@ -31,13 +30,6 @@ class Probe:
             requires_approval=approval,
             concurrency_safe=safe,
         )
-
-
-def make_agent(client: ScriptedClient, *tools: Tool, approve=None) -> Agent:
-    registry = ToolRegistry()
-    for tool in tools:
-        registry.register(tool)
-    return Agent(client, registry, "test", "scripted", 1000, approve=approve)
 
 
 async def test_safe_calls_run_together():

@@ -6,9 +6,13 @@ so a test can check what the agent did and what it sent.
 
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
 from typing import Any
 
 from anthropic.types import Message, TextBlock, ToolUseBlock, Usage
+
+from harness.agent import Agent
+from harness.tools import Tool, ToolRegistry
 
 
 def text(t: str) -> TextBlock:
@@ -34,12 +38,44 @@ def reply(*blocks: TextBlock | ToolUseBlock, stop_reason: str | None = None) -> 
     )
 
 
+class _ScriptedStream:
+    """Mimics the SDK's message stream: text in small chunks, then the full Message."""
+
+    def __init__(self, message: Message) -> None:
+        self._message = message
+
+    async def __aenter__(self) -> _ScriptedStream:
+        return self
+
+    async def __aexit__(self, *exc: Any) -> None:
+        return None
+
+    @property
+    def text_stream(self) -> AsyncIterator[str]:
+        return self._chunks()
+
+    async def _chunks(self) -> AsyncIterator[str]:
+        for block in self._message.content:
+            if block.type == "text":
+                for i in range(0, len(block.text), 4):
+                    yield block.text[i : i + 4]
+
+    async def get_final_message(self) -> Message:
+        return self._message
+
+
 class _ScriptedMessages:
     def __init__(self, replies: list[Message]) -> None:
         self.replies = replies
         self.requests: list[dict[str, Any]] = []
 
     async def create(self, **kwargs: Any) -> Message:
+        return self._next(kwargs)
+
+    def stream(self, **kwargs: Any) -> _ScriptedStream:
+        return _ScriptedStream(self._next(kwargs))
+
+    def _next(self, kwargs: dict[str, Any]) -> Message:
         # Snapshot the history: the agent keeps appending to the same list.
         self.requests.append({**kwargs, "messages": list(kwargs["messages"])})
         if not self.replies:
@@ -54,3 +90,11 @@ class ScriptedClient:
     @property
     def requests(self) -> list[dict[str, Any]]:
         return self.messages.requests
+
+
+def make_agent(client: ScriptedClient, *tools: Tool, **hooks: Any) -> Agent:
+    """An Agent over the given tools, talking to a scripted model."""
+    registry = ToolRegistry()
+    for tool in tools:
+        registry.register(tool)
+    return Agent(client, registry, "test", "scripted", 1000, **hooks)

@@ -34,11 +34,37 @@ def build_system_prompt(workdir: Path) -> str:
     )
 
 
-def console_trace(name: str, tool_input: dict[str, Any]) -> None:
-    text = json.dumps(tool_input, ensure_ascii=False)
-    if len(text) > 120:
-        text = text[:117] + "..."
-    print(f"  ⏺ {name}({text})")
+class Console:
+    """Terminal frontend: prints model text as it streams in, and keeps tool
+    traces on their own lines even when they land mid-sentence."""
+
+    def __init__(self) -> None:
+        self.speaking = False  # "myHarnessAgent>" already printed for this run of text
+        self.mid_line = False  # the cursor is not at the start of a line
+
+    def text(self, chunk: str) -> None:
+        if not self.speaking:
+            print("\nmyHarnessAgent> ", end="")
+            self.speaking = True
+        print(chunk, end="", flush=True)  # flush, or the terminal buffers until newline
+        self.mid_line = not chunk.endswith("\n")
+
+    def trace(self, name: str, tool_input: dict[str, Any]) -> None:
+        self._finish_line()
+        text = json.dumps(tool_input, ensure_ascii=False)
+        if len(text) > 120:
+            text = text[:117] + "..."
+        print(f"  ⏺ {name}({text})")
+        self.speaking = False  # text after the tools gets a fresh prefix
+
+    def end_turn(self) -> None:
+        self._finish_line()
+        self.speaking = False
+
+    def _finish_line(self) -> None:
+        if self.mid_line:
+            print()
+            self.mid_line = False
 
 
 async def console_approve(name: str, tool_input: dict[str, Any]) -> bool:
@@ -77,6 +103,7 @@ async def main() -> None:
         print(line)
 
     async with anthropic.AsyncAnthropic() as client:  # picks up ANTHROPIC_API_KEY itself
+        console = Console()
         agent = Agent(
             client,
             registry,
@@ -84,7 +111,8 @@ async def main() -> None:
             model,
             max_tokens,
             approve=console_approve,
-            on_trace=console_trace,
+            on_trace=console.trace,
+            on_text=console.text,
         )
 
         print(f"MyHarness · {model} · /tools lists tools · /clear wipes history · /exit quits")
@@ -109,19 +137,19 @@ async def main() -> None:
                         print(f"  {name}")
                     continue
 
+                # The reply prints itself as it streams; we only report problems.
+                problem = None
                 try:
-                    result = await agent.run_turn(user_input)
+                    await agent.run_turn(user_input)
                 except KeyboardInterrupt:  # Ctrl-C while waiting on the model
-                    print("\n(interrupted — turn discarded)")
-                    continue
+                    problem = "(interrupted — turn discarded)"
                 except anthropic.APIStatusError as exc:  # the API said no (4xx/5xx)
-                    print(f"[api error {exc.status_code}] {exc.message}")
-                    continue
+                    problem = f"[api error {exc.status_code}] {exc.message}"
                 except anthropic.APIConnectionError:  # never reached the API
-                    print("[network error — check your connection]")
-                    continue
-
-                print(f"\nmyHarnessAgent> {result.text}")
+                    problem = "[network error — check your connection]"
+                console.end_turn()
+                if problem:
+                    print(problem)
         finally:
             await mcp.aclose()  # shut down server connections/subprocesses
 

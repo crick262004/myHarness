@@ -31,9 +31,10 @@ MAX_TOOL_CALLS_PER_TURN = 50
 
 # Frontend hooks. The Agent does no console I/O itself — the REPL passes
 # console implementations; evals pass nothing (approve=None runs gated tools
-# without asking, on_trace=None is silent).
+# without asking, on_trace=None and on_text=None are silent).
 ApproveFn = Callable[[str, dict[str, Any]], Awaitable[bool]]
 TraceFn = Callable[[str, dict[str, Any]], None]
+TextFn = Callable[[str], None]  # receives each chunk of model text as it arrives
 
 
 @dataclass
@@ -71,6 +72,7 @@ class Agent:
         *,
         approve: ApproveFn | None = None,
         on_trace: TraceFn | None = None,
+        on_text: TextFn | None = None,
     ) -> None:
         self.client = client
         self.registry = registry
@@ -81,6 +83,7 @@ class Agent:
         self.max_tokens = max_tokens
         self.approve = approve
         self.on_trace = on_trace
+        self.on_text = on_text
         # THE conversation. Entries: {"role": "user"|"assistant", "content": ...}
         self.messages: list[dict[str, Any]] = []
         self.total_input_tokens = 0
@@ -113,14 +116,7 @@ class Agent:
             # Once the budget is spent, tool_choice "none" forces a text
             # answer — the loop is guaranteed to terminate on the next reply.
             budget_spent = len(records) >= MAX_TOOL_CALLS_PER_TURN
-            response = await self.client.messages.create(
-                model=self.model,
-                max_tokens=self.max_tokens,
-                system=self.system_prompt,
-                messages=self.messages,          # the ENTIRE history, every time
-                tools=self.registry.schemas(),   # "these tools exist"
-                tool_choice={"type": "none" if budget_spent else "auto"},
-            )
+            response = await self._call_model(tool_choice="none" if budget_spent else "auto")
             turn_in += response.usage.input_tokens
             turn_out += response.usage.output_tokens
 
@@ -158,10 +154,14 @@ class Agent:
         self.total_output_tokens += turn_out
 
         text = "".join(block.text for block in response.content if block.type == "text")
-        if response.stop_reason == "refusal":
-            text = text or "[The model declined this request.]"
+        notice = ""
+        if response.stop_reason == "refusal" and not text:
+            notice = "[The model declined this request.]"
         elif response.stop_reason == "max_tokens":
-            text += "\n[warning: response cut off at max_tokens]"
+            notice = "\n[warning: response cut off at max_tokens]"
+        if notice and self.on_text is not None:
+            self.on_text(notice)  # the reply was streamed live; the notice goes the same way
+        text += notice
 
         return TurnResult(
             text=text,
@@ -170,6 +170,27 @@ class Agent:
             input_tokens=turn_in,
             output_tokens=turn_out,
         )
+
+    async def _call_model(self, tool_choice: str) -> Any:
+        """One model call, streamed: text reaches on_text as it is generated.
+
+        The API sends the reply as a series of small events (server-sent
+        events). The SDK stream adds them up as they arrive, so
+        get_final_message() returns the same complete Message a non-streaming
+        create() would — the rest of the loop doesn't change at all.
+        """
+        async with self.client.messages.stream(
+            model=self.model,
+            max_tokens=self.max_tokens,
+            system=self.system_prompt,
+            messages=self.messages,          # the ENTIRE history, every time
+            tools=self.registry.schemas(),   # "these tools exist"
+            tool_choice={"type": tool_choice},
+        ) as stream:
+            async for chunk in stream.text_stream:
+                if self.on_text is not None:
+                    self.on_text(chunk)
+            return await stream.get_final_message()
 
     async def _run_tools(
         self, blocks: list[Any], records: list[ToolCallRecord]
