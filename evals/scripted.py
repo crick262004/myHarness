@@ -23,7 +23,11 @@ def tool_use(id_: str, name: str, **tool_input: Any) -> ToolUseBlock:
     return ToolUseBlock(type="tool_use", id=id_, name=name, input=tool_input)
 
 
-def reply(*blocks: TextBlock | ToolUseBlock, stop_reason: str | None = None) -> Message:
+def reply(
+    *blocks: TextBlock | ToolUseBlock,
+    stop_reason: str | None = None,
+    usage: Usage | None = None,
+) -> Message:
     if stop_reason is None:
         stop_reason = "tool_use" if any(b.type == "tool_use" for b in blocks) else "end_turn"
     return Message(
@@ -34,7 +38,7 @@ def reply(*blocks: TextBlock | ToolUseBlock, stop_reason: str | None = None) -> 
         content=list(blocks),
         stop_reason=stop_reason,
         stop_sequence=None,
-        usage=Usage(input_tokens=10, output_tokens=5),
+        usage=usage or Usage(input_tokens=10, output_tokens=5),
     )
 
 

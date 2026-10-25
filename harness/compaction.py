@@ -1,9 +1,16 @@
 """Context compaction: keep a long conversation inside a token budget.
 
 Every API call re-sends the whole history, so each turn costs more and runs
-slower than the last, and eventually the context window runs out. Compaction
-replaces the older turns with a summary the model writes itself, and keeps
-the most recent turns word for word.
+slower than the last, and eventually the context window runs out. Two tiers,
+cheapest first:
+
+  1. Clear old tool results. Tool output is usually most of an agent's
+     context, and once the model has read it and replied, its own reply has
+     captured what mattered. Blanking it costs nothing — no model call.
+  2. Summarize. Only if clearing wasn't enough: the model writes a summary
+     that replaces the older turns.
+
+Either way the most recent turns stay word for word.
 """
 
 from __future__ import annotations
@@ -11,8 +18,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+from .caching import cached_messages, cached_system, cached_tools
+
 KEEP_RECENT_TURNS = 2       # the latest turns stay verbatim
 SUMMARY_MAX_TOKENS = 8_000  # room for thinking plus the summary itself
+CHARS_PER_TOKEN = 4         # rough rule of thumb, only used to pick a tier
+CLEARED = "[old tool result cleared to save context]"
 
 # Framed as a handoff note on purpose. An earlier "summarize so you can
 # continue from it" wording was refused by Claude Fable 5's safety filter as
@@ -33,9 +44,13 @@ class CompactionError(Exception):
 
 @dataclass
 class Compaction:
-    turns: int          # earlier turns folded into the summary
-    tokens_before: int  # prompt size that triggered it (0 if unknown)
-    summary: str
+    """What one compaction step did. Tier 1 fills `cleared`, tier 2 `turns`."""
+
+    tokens_before: int       # prompt size that triggered it (0 if unknown)
+    cleared: int = 0         # tier 1: old tool results blanked
+    tokens_freed: int = 0    # tier 1: estimated tokens that removed
+    turns: int = 0           # tier 2: earlier turns folded into the summary
+    summary: str = ""        # tier 2: the summary itself
 
 
 def prompt_tokens(usage: Any) -> int:
@@ -75,6 +90,34 @@ def split_history(
     return messages[:cut], messages[cut:]
 
 
+def clear_old_tool_results(
+    messages: list[dict[str, Any]], keep_turns: int
+) -> tuple[list[dict[str, Any]], int, int]:
+    """Tier 1: blank the output of every tool call older than the last turns.
+
+    The tool_use block stays (what was called, with which input), so the
+    model still knows what it did; only the result body is swapped for a
+    short marker. Builds new message dicts rather than editing in place.
+    Returns (new_messages, results_cleared, chars_removed).
+    """
+    old, recent = split_history(messages, keep_turns)
+    cleared = chars = 0
+    out: list[dict[str, Any]] = []
+    for message in old:
+        if message["role"] != "user" or isinstance(message["content"], str):
+            out.append(message)
+            continue
+        blocks = []
+        for block in message["content"]:
+            if block.get("type") == "tool_result" and block.get("content") != CLEARED:
+                chars += len(str(block.get("content", "")))
+                block = {**block, "content": CLEARED}
+                cleared += 1
+            blocks.append(block)
+        out.append({**message, "content": blocks})
+    return out + recent, cleared, chars
+
+
 async def summarize(
     client: Any,
     *,
@@ -82,28 +125,29 @@ async def summarize(
     system: str,
     tools: list[dict[str, Any]],
     old: list[dict[str, Any]],
-) -> str:
-    """Ask the model to summarize `old`. A side call: not shown, not kept.
+) -> tuple[str, Any]:
+    """Tier 2: ask the model to summarize `old`. Returns (summary, usage).
 
-    It sends the same system prompt, tools and history as the agent's normal
-    calls (tools are required anyway once history holds tool_use blocks), so
-    the request starts with the same bytes and a prompt cache can be reused.
-    tool_choice "none" makes sure it answers in text.
+    A side call: not shown, not kept. It sends the same tools, system prompt,
+    history and cache breakpoints as the agent's normal calls (tools are
+    required anyway once history holds tool_use blocks), so it starts with
+    the same bytes and reads the history from the prompt cache. tool_choice
+    "none" makes sure it answers in text.
     """
     response = await client.messages.create(
         model=model,
         max_tokens=SUMMARY_MAX_TOKENS,
-        system=system,
-        tools=tools,
+        system=cached_system(system),
+        tools=cached_tools(tools),
         tool_choice={"type": "none"},
-        messages=[*old, {"role": "user", "content": SUMMARY_PROMPT}],
+        messages=cached_messages([*old, {"role": "user", "content": SUMMARY_PROMPT}]),
     )
     if response.stop_reason == "refusal":
         raise CompactionError("the model declined to write the summary")
     summary = "".join(b.text for b in response.content if b.type == "text").strip()
     if not summary:
         raise CompactionError("the summary came back empty")
-    return summary
+    return summary, response.usage
 
 
 def summary_messages(summary: str) -> list[dict[str, Any]]:

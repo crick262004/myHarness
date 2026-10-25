@@ -15,7 +15,7 @@ from typing import Any
 import anthropic
 from dotenv import load_dotenv
 
-from .agent import Agent
+from .agent import Agent, TokenUsage
 from .compaction import Compaction, CompactionError
 from .mcp_client import MCPManager
 from .tools import ToolRegistry, build_builtin_tools
@@ -64,8 +64,19 @@ class Console:
     def compacted(self, c: Compaction) -> None:
         self._finish_line()
         size = f" at ~{c.tokens_before:,} tokens" if c.tokens_before else ""
-        words = len(c.summary.split())
-        print(f"(context compacted{size}: {c.turns} earlier turns → a {words}-word summary)")
+        if c.summary:
+            words = len(c.summary.split())
+            print(f"(context compacted{size}: {c.turns} earlier turns → a {words}-word summary)")
+        else:
+            print(f"(context trimmed{size}: cleared {c.cleared} old tool results, ~{c.tokens_freed:,} tokens)")
+
+    def turn_stats(self, u: TokenUsage) -> None:
+        """One line per turn: is the cache actually being hit?"""
+        calls = f"{u.calls} call{'s' if u.calls != 1 else ''}"
+        print(
+            f"  · {calls} · prompt {u.prompt:,} tokens"
+            f" ({u.cache_hit_rate:.0%} from cache) · {u.output:,} out"
+        )
 
     def end_turn(self) -> None:
         self._finish_line()
@@ -84,6 +95,15 @@ async def console_approve(name: str, tool_input: dict[str, Any]) -> bool:
     for line in json.dumps(tool_input, indent=2, ensure_ascii=False).splitlines():
         print(f"    {line}")
     return input("  allow? [y/N] ").strip().lower() in ("y", "yes")
+
+
+def print_usage(u: TokenUsage) -> None:
+    print(f"  session: {u.calls} API calls · prompt {u.prompt:,} tokens · output {u.output:,}")
+    print(
+        f"  prompt split: {u.cache_read:,} read from cache ({u.cache_hit_rate:.0%})"
+        f" · {u.cache_write:,} written to cache · {u.fresh:,} uncached"
+    )
+    print(f"  input cost vs. no caching: {u.input_cost_saved:.0%} cheaper")
 
 
 def build_registry(workdir: Path) -> ToolRegistry:
@@ -129,8 +149,8 @@ async def main() -> None:
         )
 
         print(
-            f"MyHarness · {model} · /tools lists tools · /compact summarizes old turns"
-            " · /clear wipes history · /exit quits"
+            f"MyHarness · {model} · /tools lists tools · /usage shows token stats"
+            " · /compact summarizes old turns · /clear wipes history · /exit quits"
         )
         try:
             while True:
@@ -152,6 +172,9 @@ async def main() -> None:
                     for name in registry.names():
                         print(f"  {name}")
                     continue
+                if user_input == "/usage":
+                    print_usage(agent.usage)
+                    continue
                 if user_input == "/compact":
                     try:
                         if await agent.compact() is None:
@@ -161,9 +184,9 @@ async def main() -> None:
                     continue
 
                 # The reply prints itself as it streams; we only report problems.
-                problem = None
+                problem = result = None
                 try:
-                    await agent.run_turn(user_input)
+                    result = await agent.run_turn(user_input)
                 except KeyboardInterrupt:  # Ctrl-C while waiting on the model
                     problem = "(interrupted — turn discarded)"
                 except anthropic.APIStatusError as exc:  # the API said no (4xx/5xx)
@@ -173,6 +196,8 @@ async def main() -> None:
                 console.end_turn()
                 if problem:
                     print(problem)
+                if result is not None:
+                    console.turn_stats(result.usage)
         finally:
             await mcp.aclose()  # shut down server connections/subprocesses
 

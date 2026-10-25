@@ -23,10 +23,13 @@ from typing import Any, Awaitable, Callable
 import anthropic
 from anthropic import AsyncAnthropic
 
+from .caching import READ_PRICE, WRITE_PRICE, cached_messages, cached_system, cached_tools
 from .compaction import (
+    CHARS_PER_TOKEN,
     KEEP_RECENT_TURNS,
     Compaction,
     CompactionError,
+    clear_old_tool_results,
     prompt_tokens,
     split_history,
     summarize,
@@ -60,14 +63,53 @@ class ToolCallRecord:
 
 
 @dataclass
+class TokenUsage:
+    """Token counts as the API reports them, added up over many calls.
+
+    A prompt's tokens split three ways: `fresh` (processed at full price),
+    `cache_write` (processed, then stored for reuse) and `cache_read`
+    (served from the cache).
+    """
+
+    fresh: int = 0
+    cache_write: int = 0
+    cache_read: int = 0
+    output: int = 0
+    calls: int = 0
+
+    def add(self, usage: Any) -> None:
+        self.fresh += usage.input_tokens
+        self.cache_write += usage.cache_creation_input_tokens or 0
+        self.cache_read += usage.cache_read_input_tokens or 0
+        self.output += usage.output_tokens
+        self.calls += 1
+
+    @property
+    def prompt(self) -> int:
+        return self.fresh + self.cache_write + self.cache_read
+
+    @property
+    def cache_hit_rate(self) -> float:
+        """Share of prompt tokens served from the cache."""
+        return self.cache_read / self.prompt if self.prompt else 0.0
+
+    @property
+    def input_cost_saved(self) -> float:
+        """Share of input cost saved compared to sending the same prompts uncached."""
+        if not self.prompt:
+            return 0.0
+        paid = self.fresh + WRITE_PRICE * self.cache_write + READ_PRICE * self.cache_read
+        return 1 - paid / self.prompt
+
+
+@dataclass
 class TurnResult:
     """Everything one user turn produced. The REPL prints .text; evals read the rest."""
 
     text: str
     stop_reason: str | None
     tool_calls: list[ToolCallRecord] = field(default_factory=list)
-    input_tokens: int = 0
-    output_tokens: int = 0
+    usage: TokenUsage = field(default_factory=TokenUsage)
 
     def tool_names(self) -> list[str]:
         return [call.name for call in self.tool_calls]
@@ -104,8 +146,7 @@ class Agent:
         self.on_compact = on_compact
         # THE conversation. Entries: {"role": "user"|"assistant", "content": ...}
         self.messages: list[dict[str, Any]] = []
-        self.total_input_tokens = 0
-        self.total_output_tokens = 0
+        self.usage = TokenUsage()    # whole session, side calls included
         self.last_prompt_tokens = 0  # size of the most recent request, as the API measured it
 
     def clear(self) -> None:
@@ -124,19 +165,45 @@ class Agent:
         old, recent = split_history(self.messages, keep_turns)
         if not old:
             return None
-        summary = await summarize(
+        summary, usage = await summarize(
             self.client,
             model=self.model,
             system=self.system_prompt,
             tools=self.registry.schemas(),
             old=old,
         )
-        result = Compaction(len(turn_starts(old)), self.last_prompt_tokens, summary)
+        self.usage.add(usage)
+        result = Compaction(
+            tokens_before=self.last_prompt_tokens, turns=len(turn_starts(old)), summary=summary
+        )
         self.messages = summary_messages(summary) + recent
         self.last_prompt_tokens = 0  # unknown until the next call measures it
         if self.on_compact is not None:
             self.on_compact(result)
         return result
+
+    async def _shrink_context(self) -> None:
+        """Get back under the compaction threshold, cheapest tier first.
+
+        Tier 1 clears old tool results — no model call. If the estimated size
+        is still over the threshold, tier 2 summarizes, now from the cleared
+        (smaller) history. The estimate only picks the tier; the next real
+        call measures the true size.
+        """
+        before = self.last_prompt_tokens
+        cleaned, cleared, chars = clear_old_tool_results(self.messages, KEEP_RECENT_TURNS)
+        if cleared:
+            self.messages = cleaned
+            freed = chars // CHARS_PER_TOKEN
+            self.last_prompt_tokens = max(before - freed, 0)
+            if self.on_compact is not None:
+                self.on_compact(Compaction(tokens_before=before, cleared=cleared, tokens_freed=freed))
+            if self.last_prompt_tokens < self.compact_at:
+                return
+        try:
+            await self.compact()
+        except (anthropic.APIError, CompactionError):
+            pass  # it's an optimization: carry on with the history we have
 
     async def run_turn(self, user_input: str) -> TurnResult:
         """One user turn — which may now span MANY model calls and tool runs.
@@ -148,10 +215,7 @@ class Agent:
         # Compaction runs BETWEEN turns: it only ever sees completed turns,
         # and never touches a tool chain that is still in flight.
         if self.compact_at is not None and self.last_prompt_tokens >= self.compact_at:
-            try:
-                await self.compact()
-            except (anthropic.APIError, CompactionError):
-                pass  # it's an optimization: carry on with the full history
+            await self._shrink_context()
         start = len(self.messages)
         try:
             return await self._turn(user_input)
@@ -162,15 +226,15 @@ class Agent:
     async def _turn(self, user_input: str) -> TurnResult:
         self.messages.append({"role": "user", "content": user_input})
         records: list[ToolCallRecord] = []
-        turn_in = turn_out = 0
+        turn_usage = TokenUsage()
 
         while True:
             # Once the budget is spent, tool_choice "none" forces a text
             # answer — the loop is guaranteed to terminate on the next reply.
             budget_spent = len(records) >= MAX_TOOL_CALLS_PER_TURN
             response = await self._call_model(tool_choice="none" if budget_spent else "auto")
-            turn_in += response.usage.input_tokens
-            turn_out += response.usage.output_tokens
+            turn_usage.add(response.usage)
+            self.usage.add(response.usage)
             self.last_prompt_tokens = prompt_tokens(response.usage)
 
             # Append the reply verbatim. content is a list of blocks — text,
@@ -203,10 +267,7 @@ class Agent:
             results = await self._run_tools(tool_uses, records)
             self.messages.append({"role": "user", "content": results})
 
-        self.total_input_tokens += turn_in
-        self.total_output_tokens += turn_out
-
-        text = "".join(block.text for block in response.content if block.type == "text")
+        text ="".join(block.text for block in response.content if block.type == "text")
         notice = ""
         if response.stop_reason == "refusal" and not text:
             notice = "[The model declined this request.]"
@@ -220,8 +281,7 @@ class Agent:
             text=text,
             stop_reason=response.stop_reason,
             tool_calls=records,
-            input_tokens=turn_in,
-            output_tokens=turn_out,
+            usage=turn_usage,
         )
 
     async def _call_model(self, tool_choice: str) -> Any:
@@ -231,13 +291,16 @@ class Agent:
         events). The SDK stream adds them up as they arrive, so
         get_final_message() returns the same complete Message a non-streaming
         create() would — the rest of the loop doesn't change at all.
+
+        The cached_* wrappers add prompt-cache breakpoints to copies, so the
+        part of the prompt the previous call already sent is billed at 10%.
         """
         async with self.client.messages.stream(
             model=self.model,
             max_tokens=self.max_tokens,
-            system=self.system_prompt,
-            messages=self.messages,          # the ENTIRE history, every time
-            tools=self.registry.schemas(),   # "these tools exist"
+            system=cached_system(self.system_prompt),
+            messages=cached_messages(self.messages),     # the ENTIRE history, every time
+            tools=cached_tools(self.registry.schemas()),  # "these tools exist"
             tool_choice={"type": tool_choice},
         ) as stream:
             async for chunk in stream.text_stream:
