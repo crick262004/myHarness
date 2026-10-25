@@ -20,8 +20,19 @@ import asyncio
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable
 
+import anthropic
 from anthropic import AsyncAnthropic
 
+from .compaction import (
+    KEEP_RECENT_TURNS,
+    Compaction,
+    CompactionError,
+    prompt_tokens,
+    split_history,
+    summarize,
+    summary_messages,
+    turn_starts,
+)
 from .tools import ToolRegistry
 
 # Safety valve: total tool executions allowed in ONE user turn, summed across
@@ -35,6 +46,7 @@ MAX_TOOL_CALLS_PER_TURN = 50
 ApproveFn = Callable[[str, dict[str, Any]], Awaitable[bool]]
 TraceFn = Callable[[str, dict[str, Any]], None]
 TextFn = Callable[[str], None]  # receives each chunk of model text as it arrives
+CompactFn = Callable[[Compaction], None]
 
 
 @dataclass
@@ -73,6 +85,8 @@ class Agent:
         approve: ApproveFn | None = None,
         on_trace: TraceFn | None = None,
         on_text: TextFn | None = None,
+        compact_at: int | None = None,
+        on_compact: CompactFn | None = None,
     ) -> None:
         self.client = client
         self.registry = registry
@@ -84,14 +98,45 @@ class Agent:
         self.approve = approve
         self.on_trace = on_trace
         self.on_text = on_text
+        # Compact before a turn once the last prompt reached this many tokens
+        # (None = never automatically).
+        self.compact_at = compact_at
+        self.on_compact = on_compact
         # THE conversation. Entries: {"role": "user"|"assistant", "content": ...}
         self.messages: list[dict[str, Any]] = []
         self.total_input_tokens = 0
         self.total_output_tokens = 0
+        self.last_prompt_tokens = 0  # size of the most recent request, as the API measured it
 
     def clear(self) -> None:
         """Instant amnesia — proves the memory was only ever this list."""
         self.messages = []
+        self.last_prompt_tokens = 0
+
+    async def compact(self, keep_turns: int = KEEP_RECENT_TURNS) -> Compaction | None:
+        """Replace all but the last `keep_turns` turns with a model-written summary.
+
+        Returns None if there is nothing old enough to summarize. Raises
+        CompactionError (or an API error) if the summary call fails. The swap
+        happens in one assignment at the end, so a failure or Ctrl-C midway
+        leaves the history exactly as it was.
+        """
+        old, recent = split_history(self.messages, keep_turns)
+        if not old:
+            return None
+        summary = await summarize(
+            self.client,
+            model=self.model,
+            system=self.system_prompt,
+            tools=self.registry.schemas(),
+            old=old,
+        )
+        result = Compaction(len(turn_starts(old)), self.last_prompt_tokens, summary)
+        self.messages = summary_messages(summary) + recent
+        self.last_prompt_tokens = 0  # unknown until the next call measures it
+        if self.on_compact is not None:
+            self.on_compact(result)
+        return result
 
     async def run_turn(self, user_input: str) -> TurnResult:
         """One user turn — which may now span MANY model calls and tool runs.
@@ -100,6 +145,13 @@ class Agent:
         midway (API error, Ctrl-C during a tool) is rolled back wholesale:
         everything appended since the turn started is discarded.
         """
+        # Compaction runs BETWEEN turns: it only ever sees completed turns,
+        # and never touches a tool chain that is still in flight.
+        if self.compact_at is not None and self.last_prompt_tokens >= self.compact_at:
+            try:
+                await self.compact()
+            except (anthropic.APIError, CompactionError):
+                pass  # it's an optimization: carry on with the full history
         start = len(self.messages)
         try:
             return await self._turn(user_input)
@@ -119,6 +171,7 @@ class Agent:
             response = await self._call_model(tool_choice="none" if budget_spent else "auto")
             turn_in += response.usage.input_tokens
             turn_out += response.usage.output_tokens
+            self.last_prompt_tokens = prompt_tokens(response.usage)
 
             # Append the reply verbatim. content is a list of blocks — text,
             # tool_use, and (on this model) thinking blocks. The API wants

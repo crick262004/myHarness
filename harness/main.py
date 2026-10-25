@@ -16,6 +16,7 @@ import anthropic
 from dotenv import load_dotenv
 
 from .agent import Agent
+from .compaction import Compaction, CompactionError
 from .mcp_client import MCPManager
 from .tools import ToolRegistry, build_builtin_tools
 
@@ -23,6 +24,9 @@ from .tools import ToolRegistry, build_builtin_tools
 # environment (a local .env is loaded below), with sensible defaults.
 DEFAULT_MODEL = "claude-opus-5"
 DEFAULT_MAX_TOKENS = 16_000
+# Far below the 1M-token window on purpose: every call re-sends the whole
+# history, so a big context costs money and time on every single turn.
+DEFAULT_COMPACT_AT = 150_000
 
 
 def build_system_prompt(workdir: Path) -> str:
@@ -56,6 +60,12 @@ class Console:
             text = text[:117] + "..."
         print(f"  ⏺ {name}({text})")
         self.speaking = False  # text after the tools gets a fresh prefix
+
+    def compacted(self, c: Compaction) -> None:
+        self._finish_line()
+        size = f" at ~{c.tokens_before:,} tokens" if c.tokens_before else ""
+        words = len(c.summary.split())
+        print(f"(context compacted{size}: {c.turns} earlier turns → a {words}-word summary)")
 
     def end_turn(self) -> None:
         self._finish_line()
@@ -91,6 +101,7 @@ async def main() -> None:
 
     model = os.environ.get("MYHARNESS_MODEL", DEFAULT_MODEL)
     max_tokens = int(os.environ.get("MYHARNESS_MAX_TOKENS", DEFAULT_MAX_TOKENS))
+    compact_at = int(os.environ.get("MYHARNESS_COMPACT_AT", DEFAULT_COMPACT_AT)) or None  # 0 = off
 
     workdir = Path.cwd()
     registry = build_registry(workdir)
@@ -113,9 +124,14 @@ async def main() -> None:
             approve=console_approve,
             on_trace=console.trace,
             on_text=console.text,
+            compact_at=compact_at,
+            on_compact=console.compacted,
         )
 
-        print(f"MyHarness · {model} · /tools lists tools · /clear wipes history · /exit quits")
+        print(
+            f"MyHarness · {model} · /tools lists tools · /compact summarizes old turns"
+            " · /clear wipes history · /exit quits"
+        )
         try:
             while True:
                 try:
@@ -135,6 +151,13 @@ async def main() -> None:
                 if user_input == "/tools":
                     for name in registry.names():
                         print(f"  {name}")
+                    continue
+                if user_input == "/compact":
+                    try:
+                        if await agent.compact() is None:
+                            print("(nothing to compact yet — only recent turns in history)")
+                    except (anthropic.APIError, CompactionError) as exc:
+                        print(f"[compaction failed] {exc}")
                     continue
 
                 # The reply prints itself as it streams; we only report problems.
