@@ -2,6 +2,7 @@ import asyncio
 from typing import Any
 
 from evals.scripted import ScriptedClient, make_agent, reply, text, tool_use
+from harness.permissions import Policy
 from harness.tools import Tool
 
 
@@ -13,7 +14,7 @@ class Probe:
         self.peak = 0
         self.calls: list[str] = []
 
-    def tool(self, name: str, *, safe: bool, approval: bool = False) -> Tool:
+    def tool(self, name: str, *, safe: bool) -> Tool:
         async def handler(tool_input: dict[str, Any]) -> str:
             self.calls.append(f"{name}:{tool_input['x']}")
             self.now += 1
@@ -27,7 +28,6 @@ class Probe:
             description="probe",
             input_schema={"type": "object", "properties": {"x": {"type": "integer"}}},
             handler=handler,
-            requires_approval=approval,
             concurrency_safe=safe,
         )
 
@@ -82,7 +82,7 @@ async def test_results_come_back_in_request_order_in_one_message():
     assert result.tool_names() == ["read", "read"]
 
 
-async def test_declined_call_never_runs():
+async def test_declined_call_never_runs(tmp_path):
     probe = Probe()
 
     async def approve(name: str, tool_input: dict[str, Any]) -> bool:
@@ -92,7 +92,8 @@ async def test_declined_call_never_runs():
         reply(tool_use("a", "write", x=1), tool_use("b", "write", x=2)),
         reply(text("done")),
     )
-    await make_agent(client, probe.tool("write", safe=False, approval=True), approve=approve).run_turn("go")
+    agent = make_agent(client, probe.tool("write", safe=False), policy=Policy(tmp_path), approve=approve)
+    await agent.run_turn("go")
 
     assert probe.calls == ["write:1"]
     declined = client.requests[1]["messages"][-1]["content"][1]

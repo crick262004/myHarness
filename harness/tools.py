@@ -15,6 +15,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
+from jsonschema import validators
+from jsonschema.exceptions import SchemaError, best_match
+
 # Tool output is unbounded, untrusted text; cap it so one giant file or a
 # runaway command can't flood the context window.
 MAX_OUTPUT_CHARS = 50_000
@@ -33,7 +36,6 @@ class Tool:
     description: str
     input_schema: dict[str, Any]
     handler: Handler
-    requires_approval: bool = False
     # Safe to run at the same time as other calls: it only reads, so order
     # can't matter. Anything that writes stays serialized.
     concurrency_safe: bool = False
@@ -62,6 +64,28 @@ class ToolRegistry:
             {"name": t.name, "description": t.description, "input_schema": t.input_schema}
             for t in self._tools.values()
         ]
+
+    def validate(self, name: str, tool_input: dict[str, Any]) -> str | None:
+        """Check the model's arguments against the tool's input schema.
+
+        Returns an error message, or None if the input is fine (or the tool is
+        unknown — execute() reports that). The model writes these arguments,
+        so wrong types and missing fields are expected; the message goes back
+        to it so it can try again.
+        """
+        tool = self._tools.get(name)
+        if tool is None:
+            return None
+        try:
+            cls = validators.validator_for(tool.input_schema)
+            cls.check_schema(tool.input_schema)
+        except SchemaError:
+            return None  # a server's broken schema shouldn't make the tool unusable
+        error = best_match(cls(tool.input_schema).iter_errors(tool_input))
+        if error is None:
+            return None
+        where = ".".join(str(p) for p in error.absolute_path)
+        return f"Invalid input for {name}{' at ' + where if where else ''}: {error.message}"
 
     async def execute(self, name: str, tool_input: dict[str, Any]) -> tuple[str, bool]:
         """Run a tool. Returns (output, is_error) — NEVER raises.
@@ -110,6 +134,7 @@ def build_builtin_tools(workdir: Path) -> list[Tool]:
         proc = await asyncio.create_subprocess_shell(
             command,
             cwd=workdir,
+            stdin=asyncio.subprocess.DEVNULL,  # a command that prompts fails fast instead of hanging
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,  # one interleaved stream, like a terminal
         )
@@ -171,7 +196,6 @@ def build_builtin_tools(workdir: Path) -> list[Tool]:
                 "required": ["command"],
             },
             handler=bash,
-            requires_approval=True,
         ),
         Tool(
             name="read_file",
@@ -204,7 +228,6 @@ def build_builtin_tools(workdir: Path) -> list[Tool]:
                 "required": ["path", "content"],
             },
             handler=write_file,
-            requires_approval=True,
         ),
         Tool(
             name="edit_file",
@@ -223,6 +246,5 @@ def build_builtin_tools(workdir: Path) -> list[Tool]:
                 "required": ["path", "old_string", "new_string"],
             },
             handler=edit_file,
-            requires_approval=True,
         ),
     ]

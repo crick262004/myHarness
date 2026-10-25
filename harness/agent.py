@@ -36,6 +36,7 @@ from .compaction import (
     summary_messages,
     turn_starts,
 )
+from .permissions import Policy
 from .tools import ToolRegistry
 
 # Safety valve: total tool executions allowed in ONE user turn, summed across
@@ -44,8 +45,9 @@ from .tools import ToolRegistry
 MAX_TOOL_CALLS_PER_TURN = 50
 
 # Frontend hooks. The Agent does no console I/O itself — the REPL passes
-# console implementations; evals pass nothing (approve=None runs gated tools
-# without asking, on_trace=None and on_text=None are silent).
+# console implementations; evals pass nothing (on_trace=None and on_text=None
+# are silent). policy=None allows every call; an "ask" verdict with no
+# approve function counts as declined.
 ApproveFn = Callable[[str, dict[str, Any]], Awaitable[bool]]
 TraceFn = Callable[[str, dict[str, Any]], None]
 TextFn = Callable[[str], None]  # receives each chunk of model text as it arrives
@@ -124,6 +126,7 @@ class Agent:
         model: str,
         max_tokens: int,
         *,
+        policy: Policy | None = None,
         approve: ApproveFn | None = None,
         on_trace: TraceFn | None = None,
         on_text: TextFn | None = None,
@@ -137,6 +140,7 @@ class Agent:
         self.system_prompt = system_prompt
         self.model = model
         self.max_tokens = max_tokens
+        self.policy = policy
         self.approve = approve
         self.on_trace = on_trace
         self.on_text = on_text
@@ -313,8 +317,9 @@ class Agent:
     ) -> list[dict[str, Any]]:
         """Run one reply's tool calls; return their tool_results in request order.
 
-        Pass 1 (one at a time) settles what can't run: over budget, or declined
-        by the user — a human can only answer one y/N prompt at a time.
+        Pass 1 (one at a time) settles what can't run: over budget, refused
+        by validation, policy, or the user — a human can only answer one y/N
+        prompt at a time.
         Pass 2 runs the rest in groups from _schedule: a group of reads goes
         out together via asyncio.gather, so the reply waits for the slowest
         read instead of the sum of all of them.
@@ -330,9 +335,10 @@ class Agent:
                 continue
             if self.on_trace is not None:
                 self.on_trace(block.name, dict(block.input))
-            if not await self._approved(block.name, dict(block.input)):
-                # The model sees the denial as an error result and moves on.
-                outcomes[i] = ("User declined to run this tool.", True)
+            blocked = await self._gate(block.name, dict(block.input))
+            if blocked is not None:
+                # The model sees the refusal as an error result and moves on.
+                outcomes[i] = (blocked, True)
 
         for group in self._schedule(blocks, outcomes):
             done = await asyncio.gather(
@@ -380,9 +386,20 @@ class Agent:
             joinable = safe
         return groups
 
-    async def _approved(self, name: str, tool_input: dict[str, Any]) -> bool:
-        """The permission gate: the model proposes, the harness decides."""
-        tool = self.registry.get(name)
-        if tool is None or not tool.requires_approval or self.approve is None:
-            return True
-        return await self.approve(name, tool_input)
+    async def _gate(self, name: str, tool_input: dict[str, Any]) -> str | None:
+        """The permission gate: the model proposes, the harness decides.
+
+        Returns None to let the call run, or the reason it must not. Input is
+        validated first, so the user is never asked about a malformed call.
+        """
+        if (error := self.registry.validate(name, tool_input)) is not None:
+            return error
+        if self.policy is None or self.registry.get(name) is None:
+            return None  # an unknown tool is reported by execute()
+        verdict = self.policy.check(name, tool_input)
+        if verdict.decision == "deny":
+            return verdict.reason
+        if verdict.decision == "ask":
+            if self.approve is None or not await self.approve(name, tool_input):
+                return "User declined to run this tool."
+        return None

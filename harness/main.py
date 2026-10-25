@@ -18,6 +18,7 @@ from dotenv import load_dotenv
 from .agent import Agent, TokenUsage
 from .compaction import Compaction, CompactionError
 from .mcp_client import MCPManager
+from .permissions import Policy
 from .tools import ToolRegistry, build_builtin_tools
 
 # Application policy lives here, not in the Agent. Values come from the
@@ -141,6 +142,7 @@ async def main() -> None:
             build_system_prompt(workdir),
             model,
             max_tokens,
+            policy=Policy.load(workdir, workdir / "permissions.json"),
             approve=console_approve,
             on_trace=console.trace,
             on_text=console.text,
@@ -149,7 +151,7 @@ async def main() -> None:
         )
 
         print(
-            f"MyHarness · {model} · /tools lists tools · /usage shows token stats"
+            f"MyHarness · {model} · /tools lists tools · /permissions shows the policy · /usage shows token stats"
             " · /compact summarizes old turns · /clear wipes history · /exit quits"
         )
         try:
@@ -174,6 +176,9 @@ async def main() -> None:
                     continue
                 if user_input == "/usage":
                     print_usage(agent.usage)
+                    continue
+                if user_input == "/permissions":
+                    print("\n".join(agent.policy.describe()))
                     continue
                 if user_input == "/compact":
                     try:

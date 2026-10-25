@@ -1,0 +1,5 @@
+{
+  "rules": [
+    { "tool": "mcp__tavily__*", "decision": "allow" }
+  ]
+}
