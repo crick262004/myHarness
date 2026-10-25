@@ -90,6 +90,14 @@ class TokenUsage:
         self.output += usage.output_tokens
         self.calls += 1
 
+    @classmethod
+    def of(cls, *usages: Any) -> TokenUsage:
+        """Totals for raw API usage objects."""
+        total = cls()
+        for usage in usages:
+            total.add(usage)
+        return total
+
     def merge(self, other: TokenUsage) -> None:
         """Add in totals already counted elsewhere (e.g. by a sub-agent)."""
         self.fresh += other.fresh
@@ -167,7 +175,7 @@ class Agent:
         # THE conversation. Entries: {"role": "user"|"assistant", "content": ...}
         self.messages: list[dict[str, Any]] = []
         self.usage = TokenUsage()    # whole session, side calls included
-        self._turn_usage = TokenUsage()  # the turn in progress (or the last one)
+        self._turn_usage: TokenUsage | None = None  # the turn in progress, if any
         self.last_prompt_tokens = 0  # size of the most recent request, as the API measured it
 
     def clear(self) -> None:
@@ -176,13 +184,22 @@ class Agent:
         self.last_prompt_tokens = 0
 
     def bill(self, usage: TokenUsage) -> None:
-        """Count tokens spent on this agent's behalf by another one (a sub-agent).
+        """Count tokens spent on this agent's behalf elsewhere (a sub-agent, a workflow).
 
-        They join the session and current-turn totals, but not
-        last_prompt_tokens: the sub-agent's context isn't this one.
+        They join the session total, and the current turn's if one is
+        running, but not last_prompt_tokens: that other context isn't this one.
         """
         self.usage.merge(usage)
-        self._turn_usage.merge(usage)
+        if self._turn_usage is not None:
+            self._turn_usage.merge(usage)
+
+    def add_exchange(self, question: str, answer: str) -> None:
+        """Record a question answered outside the loop (e.g. by a workflow) as a
+        normal turn, so the conversation can follow up on it."""
+        self.messages += [
+            {"role": "user", "content": question},
+            {"role": "assistant", "content": answer},
+        ]
 
     async def compact(self, keep_turns: int = KEEP_RECENT_TURNS) -> Compaction | None:
         """Replace all but the last `keep_turns` turns with a model-written summary.
@@ -252,6 +269,8 @@ class Agent:
         except BaseException:
             del self.messages[start:]
             raise
+        finally:
+            self._turn_usage = None
 
     async def _turn(self, user_input: str) -> TurnResult:
         # Notes go into THIS message, never the system prompt: the system

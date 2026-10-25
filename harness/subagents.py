@@ -56,32 +56,40 @@ def _labelled(hook: Callable[..., Any] | None, label: str) -> Callable[..., Any]
     return lambda name, tool_input: hook(f"{label} › {name}", tool_input)
 
 
-def build_delegate_tool(parent: Agent, system_prompt: str, model: str | None = None) -> Tool:
-    """A tool that runs a task in a new child Agent and returns its report.
+async def run_subagent(
+    parent: Agent, system_prompt: str, task: str, label: str, model: str | None = None
+) -> str:
+    """Run `task` in a new child Agent and return its final report.
 
     `model` lets sub-agents run on a different (e.g. faster, cheaper) model
     than the parent; by default they use the parent's.
     """
+    child = Agent(
+        parent.client,
+        read_only_tools(parent.registry),
+        system_prompt,
+        model or parent.model,
+        parent.max_tokens,
+        policy=parent.policy,
+        approve=_labelled(parent.approve, label),
+        on_trace=_labelled(parent.on_trace, label),
+    )
+    try:
+        result = await child.run_turn(task)
+    finally:
+        parent.bill(child.usage)  # tokens a failed sub-agent spent still cost money
+    if result.stop_reason == "refusal":
+        raise ToolError(f"The sub-agent declined the task. {result.text}".strip())
+    return result.text or "(the sub-agent finished without a report)"
+
+
+def build_delegate_tool(parent: Agent, system_prompt: str, model: str | None = None) -> Tool:
+    """A tool that hands a task to a sub-agent and returns its report."""
 
     async def delegate(tool_input: dict[str, Any]) -> str:
-        label = tool_input["description"]
-        child = Agent(
-            parent.client,
-            read_only_tools(parent.registry),
-            system_prompt,
-            model or parent.model,
-            parent.max_tokens,
-            policy=parent.policy,
-            approve=_labelled(parent.approve, label),
-            on_trace=_labelled(parent.on_trace, label),
+        return await run_subagent(
+            parent, system_prompt, tool_input["task"], tool_input["description"], model
         )
-        try:
-            result = await child.run_turn(tool_input["task"])
-        finally:
-            parent.bill(child.usage)  # tokens a failed sub-agent spent still cost money
-        if result.stop_reason == "refusal":
-            raise ToolError(f"The sub-agent declined the task. {result.text}".strip())
-        return result.text or "(the sub-agent finished without a report)"
 
     return Tool(
         name=DELEGATE,

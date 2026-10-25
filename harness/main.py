@@ -17,10 +17,13 @@ from dotenv import load_dotenv
 
 from .agent import Agent, TokenUsage, TurnResult
 from .compaction import Compaction, CompactionError
+from .graph import GraphError, Step
+from .llm import LLMError
 from .mcp_client import MCPManager
 from .memory import LocalEmbedder, MemoryStore, build_memory_tools
 from .permissions import Policy
 from .subagents import build_delegate_tool, subagent_prompt
+from .workflows import describe_step, run_research
 from .tools import ToolRegistry, build_builtin_tools
 
 # Application policy lives here, not in the Agent. Values come from the
@@ -92,6 +95,10 @@ class Console:
             f"  · {calls} · prompt {u.prompt:,} tokens"
             f" ({u.cache_hit_rate:.0%} from cache) · {u.output:,} out{recalled}"
         )
+
+    def graph_step(self, step: Step) -> None:
+        self._finish_line()
+        print(f"  ◆ {describe_step(step)}")
 
     def end_turn(self) -> None:
         self._finish_line()
@@ -172,13 +179,13 @@ async def main() -> None:
         )
         # Registered last: a sub-agent gets the read-only tools that exist
         # by now, MCP ones included.
-        registry.register(build_delegate_tool(
-            agent, subagent_prompt(workdir), model=os.environ.get("MYHARNESS_SUBAGENT_MODEL")
-        ))
+        subagent_model = os.environ.get("MYHARNESS_SUBAGENT_MODEL")
+        registry.register(build_delegate_tool(agent, subagent_prompt(workdir), model=subagent_model))
 
         print(
             f"MyHarness · {model} · /tools lists tools · /permissions shows the policy · /usage shows token stats"
-            " · /memory lists saved notes · /compact summarizes old turns · /clear wipes history · /exit quits"
+            " · /memory lists saved notes · /research <question> runs the research workflow"
+            " · /compact summarizes old turns · /clear wipes history · /exit quits"
         )
         try:
             while True:
@@ -212,6 +219,30 @@ async def main() -> None:
                         print(f"  #{note.id} {note.text}")
                     if not notes:
                         print("(no saved notes yet)")
+                    continue
+                if user_input.startswith("/research"):
+                    question = user_input.removeprefix("/research").strip()
+                    if not question:
+                        print("usage: /research <question>")
+                        continue
+                    try:
+                        state = await run_research(
+                            agent, question, subagent_prompt(workdir),
+                            subagent_model=subagent_model, memory=memory,
+                            on_step=console.graph_step,
+                        )
+                    except KeyboardInterrupt:
+                        print("(interrupted — research discarded)")
+                        continue
+                    except (anthropic.APIError, LLMError, GraphError) as exc:
+                        print(f"[research failed] {exc}")
+                        continue
+                    verdict = (
+                        "approved by the reviewer" if state["review"]["approved"]
+                        else f"not approved after {state['drafts']} drafts"
+                    )
+                    print(f"\nmyHarnessAgent> {state['draft']}\n  · {verdict}")
+                    agent.add_exchange(question, state["draft"])  # so you can follow up on it
                     continue
                 if user_input == "/compact":
                     try:

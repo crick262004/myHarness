@@ -1,37 +1,14 @@
 import logging
-import re
-import zlib
 from pathlib import Path
 
-import numpy as np
 import pytest
 
+from evals.fakes import WordEmbedder
 from evals.scripted import ScriptedClient, make_agent, reply, text, tool_use
 from harness.compaction import turn_starts
-from harness.memory import MemoryStore, build_memory_tools, format_memories, recalled_ids, unit
+from harness.memory import MemoryStore, build_memory_tools, format_memories, recalled_ids
 from harness.permissions import Policy
 from harness.tools import ToolError
-
-
-class WordEmbedder:
-    """Bag of words: texts that share words score high. No model download."""
-
-    min_score = 0.3
-
-    def __init__(self, name: str = "words") -> None:
-        self.name = name
-        self.calls = 0
-        self.broken = False
-
-    def embed(self, texts: list[str]) -> np.ndarray:
-        if self.broken:
-            raise RuntimeError("embedding model unavailable")
-        self.calls += 1
-        out = np.zeros((len(texts), 1024), dtype=np.float32)
-        for row, t in enumerate(texts):
-            for word in re.findall(r"[a-z]+", t.lower()):
-                out[row, zlib.crc32(word.encode()) % 1024] += 1
-        return unit(out)
 
 
 NEOVIM = "user prefers neovim editor"
