@@ -36,7 +36,7 @@ DEFAULT_MAX_TOKENS = 16_000
 DEFAULT_COMPACT_AT = 150_000
 # Long-term memory lives outside any one project, like a person's would.
 HOME = Path.home() / ".myharness"
-DEFAULT_MEMORY_DB = HOME / "memory.db"
+DEFAULT_MEMORY_DIR = HOME / "memory"
 
 
 MEMORY_PROMPT = (
@@ -159,7 +159,7 @@ async def main() -> None:
         print("(sandbox) OFF: bash can read and write anything you can; only the y/N prompt guards it")
     registry = build_registry(workdir, sandbox)
     memory = MemoryStore(
-        Path(os.environ.get("MYHARNESS_MEMORY_DB", DEFAULT_MEMORY_DB)).expanduser(),
+        Path(os.environ.get("MYHARNESS_MEMORY_DIR", DEFAULT_MEMORY_DIR)).expanduser(),
         LocalEmbedder(cache_dir=HOME / "models"),
     )
     for tool in build_memory_tools(memory):

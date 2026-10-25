@@ -34,6 +34,6 @@ def test_best_prefers_the_stricter_setting_on_a_tie():
 
 async def test_the_labeled_set_is_consistent(tmp_path):
     assert all(i in range(1, len(NOTES) + 1) for _, wanted in QUERIES for i in wanted)
-    store = MemoryStore(tmp_path / "m.db", WordEmbedder())
+    store = MemoryStore(tmp_path / "m", WordEmbedder())
     ranked = await rank_all(store)  # every note stored: none counted as a duplicate
     assert len(ranked) == len(QUERIES)

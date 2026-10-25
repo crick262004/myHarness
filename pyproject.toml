@@ -10,6 +10,7 @@ dependencies = [
     "python-dotenv>=1.2.2",
     "fastembed>=0.9.1",
     "numpy>=2.4.6",
+    "chromadb>=1.5.9",
 ]
 
 [dependency-groups]

@@ -1,11 +1,11 @@
 """Persistent memory: short notes that outlive the session, found by meaning.
 
 The conversation history dies with the session (or gets compacted away).
-Memory is a small SQLite file of notes the model chose to save. Each note is
-stored with its embedding: a list of numbers that places text by meaning, so
-"which editor do I like?" lands next to "User prefers neovim" even though they
-share no words. Before each turn the user's message is embedded too, and the
-closest notes are added to it.
+Memory is a small vector database (Chroma) of notes the model chose to save.
+Each note is stored with its embedding: a list of numbers that places text by
+meaning, so "which editor do I like?" lands next to "User prefers neovim" even
+though they share no words. Before each turn the user's message is embedded
+too, and the closest notes are added to it.
 
 That is RAG (retrieval-augmented generation): retrieve, add to the prompt,
 then generate.
@@ -15,13 +15,13 @@ from __future__ import annotations
 
 import asyncio
 import re
-import sqlite3
 import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
+import chromadb
 import numpy as np
 
 from .tools import Tool, ToolError
@@ -80,62 +80,74 @@ class Memory:
 
 
 class MemoryStore:
-    """Notes in SQLite, each with its vector. Search compares against all of them.
+    """Notes in a Chroma collection: each note's text, its vector and metadata.
 
-    Brute force on purpose: a personal store holds hundreds of notes, and one
-    matrix multiply over them takes well under a millisecond. Re-reading the
-    rows on every search also keeps two sessions sharing the file in sync.
+    Chroma is an embedded vector database (a local folder, no server). It
+    keeps an HNSW index over the vectors, so a search finds the nearest notes
+    without comparing against every one. We compute the embeddings ourselves
+    and hand them in, so Chroma never picks a model for us. Use one process
+    per folder at a time: Chroma's local mode isn't built for concurrent writers.
     """
 
     def __init__(self, path: Path, embedder: Embedder) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
+        path.mkdir(parents=True, exist_ok=True)
         self.embedder = embedder
-        self._db = sqlite3.connect(path)
-        self._db.execute(
-            "CREATE TABLE IF NOT EXISTS memories ("
-            " id INTEGER PRIMARY KEY, text TEXT NOT NULL, created REAL NOT NULL,"
-            " model TEXT NOT NULL, vector BLOB NOT NULL)"
+        self._client = chromadb.PersistentClient(path=str(path))
+        self._notes = self._client.get_or_create_collection(
+            "memories",
+            configuration={"hnsw": {"space": "cosine"}},  # distance = 1 - cosine similarity
+            embedding_function=None,
         )
         self._reembed_stale()
 
     def close(self) -> None:
-        self._db.close()
+        self._client.close()
 
     def _reembed_stale(self) -> None:
         """Notes embedded by a different model get new vectors from this one."""
-        stale = self._db.execute(
-            "SELECT id, text FROM memories WHERE model != ?", (self.embedder.name,)
-        ).fetchall()
-        if not stale:
+        stale = self._notes.get(where={"model": {"$ne": self.embedder.name}}, include=["documents", "metadatas"])
+        if not stale["ids"]:
             return
-        vectors = self.embedder.embed([text for _, text in stale])
-        with self._db:
-            self._db.executemany(
-                "UPDATE memories SET model = ?, vector = ? WHERE id = ?",
-                [(self.embedder.name, v.tobytes(), id_) for (id_, _), v in zip(stale, vectors)],
-            )
+        vectors = self.embedder.embed(stale["documents"])
+        self._notes.update(
+            ids=stale["ids"],
+            embeddings=vectors,
+            metadatas=[{**m, "model": self.embedder.name} for m in stale["metadatas"]],
+        )
 
     async def _embed(self, text: str) -> np.ndarray:
         # The model runs on the CPU and blocks; a worker thread keeps the
         # event loop (streaming, MCP connections) responsive meanwhile.
         return (await asyncio.to_thread(self.embedder.embed, [text]))[0]
 
-    def _ranked(self, query: np.ndarray) -> list[Memory]:
-        rows = self._db.execute(
-            "SELECT id, text, created, vector FROM memories WHERE model = ?",
-            (self.embedder.name,),
-        ).fetchall()
-        if not rows:
+    def _ranked(self, query: np.ndarray, k: int) -> list[Memory]:
+        """The k nearest notes embedded by the current model, best first."""
+        k = min(k, self.count())
+        if k == 0:
             return []
-        matrix = np.frombuffer(b"".join(r[3] for r in rows), dtype=np.float32)
-        scores = matrix.reshape(len(rows), -1) @ query
+        found = self._notes.query(
+            query_embeddings=query[None, :],
+            n_results=k,
+            where={"model": self.embedder.name},
+            include=["documents", "metadatas", "distances"],
+        )
         return [
-            Memory(rows[i][0], rows[i][1], rows[i][2], float(scores[i]))
-            for i in np.argsort(-scores)
+            Memory(int(id_), text, meta["created"], 1 - distance)
+            for id_, text, meta, distance in zip(
+                found["ids"][0], found["documents"][0], found["metadatas"][0], found["distances"][0]
+            )
         ]
 
     def count(self) -> int:
-        return self._db.execute("SELECT COUNT(*) FROM memories").fetchone()[0]
+        return self._notes.count()
+
+    def all(self) -> list[Memory]:
+        found = self._notes.get(include=["documents", "metadatas"])
+        notes = [
+            Memory(int(id_), text, meta["created"])
+            for id_, text, meta in zip(found["ids"], found["documents"], found["metadatas"])
+        ]
+        return sorted(notes, key=lambda m: m.id)
 
     async def search(
         self, query: str, k: int = TOP_K, min_score: float | None = None
@@ -144,33 +156,31 @@ class MemoryStore:
         if self.count() == 0:
             return []  # don't load the model just to search nothing
         cutoff = self.embedder.min_score if min_score is None else min_score
-        ranked = self._ranked(await self._embed(query))
-        return [m for m in ranked[:k] if m.score >= cutoff]
+        return [m for m in self._ranked(await self._embed(query), k) if m.score >= cutoff]
 
     async def add(self, text: str) -> tuple[Memory, bool]:
         """Save a note. Returns (note, True), or (the existing note, False) if
         it repeats one already stored."""
         text = " ".join(text.split())  # one line: notes are listed one per line
         vector = await self._embed(text)
-        ranked = self._ranked(vector)
-        if ranked and ranked[0].score >= DUPLICATE_SCORE:
-            return ranked[0], False
+        nearest = self._ranked(vector, 1)
+        if nearest and nearest[0].score >= DUPLICATE_SCORE:
+            return nearest[0], False
         created = time.time()
-        with self._db:
-            cursor = self._db.execute(
-                "INSERT INTO memories (text, created, model, vector) VALUES (?, ?, ?, ?)",
-                (text, created, self.embedder.name, vector.tobytes()),
-            )
-        return Memory(cursor.lastrowid, text, created), True
+        note_id = max((m.id for m in self.all()), default=0) + 1
+        self._notes.add(
+            ids=[str(note_id)],
+            embeddings=vector[None, :],
+            documents=[text],
+            metadatas=[{"created": created, "model": self.embedder.name}],
+        )
+        return Memory(note_id, text, created), True
 
     def delete(self, memory_id: int) -> bool:
-        with self._db:
-            cursor = self._db.execute("DELETE FROM memories WHERE id = ?", (memory_id,))
-        return cursor.rowcount > 0
-
-    def all(self) -> list[Memory]:
-        rows = self._db.execute("SELECT id, text, created FROM memories ORDER BY id").fetchall()
-        return [Memory(*row) for row in rows]
+        if not self._notes.get(ids=[str(memory_id)])["ids"]:
+            return False
+        self._notes.delete(ids=[str(memory_id)])
+        return True
 
 
 # How notes appear inside a user message. Framed as background, not orders:

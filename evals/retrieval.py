@@ -134,7 +134,7 @@ async def rank_all(store: MemoryStore) -> list[list[Memory]]:
 async def evaluate(model: str | None) -> None:
     embedder = LocalEmbedder(cache_dir=HOME / "models", **({"model": model} if model else {}))
     with tempfile.TemporaryDirectory() as tmp:
-        store = MemoryStore(Path(tmp) / "memory.db", embedder)
+        store = MemoryStore(Path(tmp) / "memory", embedder)
         ranked = await rank_all(store)
         store.close()
     scores = sweep(ranked, [wanted for _, wanted in QUERIES], CUTOFFS, KS)

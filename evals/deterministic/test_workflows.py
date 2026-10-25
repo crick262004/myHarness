@@ -97,7 +97,7 @@ async def test_one_failed_researcher_does_not_sink_the_run():
 
 
 async def test_saved_notes_reach_the_writer(tmp_path):
-    store = MemoryStore(tmp_path / "m.db", WordEmbedder())
+    store = MemoryStore(tmp_path / "m", WordEmbedder())
     await store.add("user prefers short answers")
     client = ScriptedClient(plan("Q?"), reply(text("found")), reply(text("short")), verdict(True))
     _, _, steps = await research(client, "Which short answers does the user prefer?", memory=store)

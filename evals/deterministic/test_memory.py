@@ -17,7 +17,7 @@ PYTEST = "project uses pytest"
 
 
 async def store_with(tmp_path: Path, *notes: str, embedder: WordEmbedder | None = None) -> MemoryStore:
-    store = MemoryStore(tmp_path / "memory.db", embedder or WordEmbedder())
+    store = MemoryStore(tmp_path / "memory", embedder or WordEmbedder())
     for note in notes:
         await store.add(note)
     return store
@@ -26,7 +26,7 @@ async def store_with(tmp_path: Path, *notes: str, embedder: WordEmbedder | None 
 async def test_notes_persist_across_sessions(tmp_path):
     (await store_with(tmp_path, NEOVIM)).close()
 
-    reopened = MemoryStore(tmp_path / "memory.db", WordEmbedder())
+    reopened = MemoryStore(tmp_path / "memory", WordEmbedder())
     assert [m.text for m in reopened.all()] == [NEOVIM]
     assert [m.text for m in await reopened.search("which editor")] == [NEOVIM]
 
@@ -52,7 +52,7 @@ async def test_changing_the_embedding_model_reembeds_old_notes(tmp_path):
     (await store_with(tmp_path, NEOVIM)).close()
 
     new_model = WordEmbedder(name="words-v2")
-    reopened = MemoryStore(tmp_path / "memory.db", new_model)
+    reopened = MemoryStore(tmp_path / "memory", new_model)
     assert new_model.calls == 1  # every old note re-embedded, in one batch
     # Search only compares vectors from the current model; this finds the
     # note only because its vector was redone.
